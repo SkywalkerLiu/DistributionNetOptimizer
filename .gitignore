@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+.pytest_cache/
+.tmp_test_runs/
+pytest-cache-files-*/
+scratch_pyogrio/
+scratch_tests/
+
+.DS_Store
+Thumbs.db
+
+# Generated data files (can be regenerated from code)
+data/outputs/
+data/terrain/

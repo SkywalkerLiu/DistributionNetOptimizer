@@ -1,0 +1,11 @@
+numpy
+scipy
+rasterio
+geopandas
+shapely
+pyproj
+matplotlib
+plotly
+pyyaml
+networkx
+pytest
