@@ -61,6 +61,8 @@ class OverlayPoint3D:
     z: np.ndarray
     color: str
     size: float
+    marker: str = "o"
+    plotly_symbol: str = "circle"
     text: list[str] | None = None
 
 
@@ -75,6 +77,8 @@ def generate_terrain_3d_previews(
     water: gpd.GeoDataFrame | None = None,
     manual_no_build: gpd.GeoDataFrame | None = None,
     planned_lines: gpd.GeoDataFrame | None = None,
+    transformer: gpd.GeoDataFrame | None = None,
+    poles: gpd.GeoDataFrame | None = None,
 ) -> dict[str, Path]:
     """Generate static and interactive 3D terrain preview files."""
 
@@ -100,6 +104,8 @@ def generate_terrain_3d_previews(
         water=water,
         manual_no_build=manual_no_build,
         planned_lines=planned_lines,
+        transformer=transformer,
+        poles=poles,
     )
 
     outputs = {
@@ -173,6 +179,8 @@ def build_scene_3d_overlays(
     water: gpd.GeoDataFrame | None = None,
     manual_no_build: gpd.GeoDataFrame | None = None,
     planned_lines: gpd.GeoDataFrame | None = None,
+    transformer: gpd.GeoDataFrame | None = None,
+    poles: gpd.GeoDataFrame | None = None,
 ) -> tuple[list[OverlayLine3D], list[OverlayPoint3D]]:
     """Build 3D overlay traces for points and boundaries on the terrain."""
 
@@ -216,31 +224,105 @@ def build_scene_3d_overlays(
             z_offset=line_offset * 1.3,
         )
     )
-    lines.extend(
-        _build_line_overlays(
-            gdf=planned_lines,
+    if planned_lines is not None and not planned_lines.empty and "line_type" in planned_lines.columns:
+        for line_type, label, color, width in (
+            ("hv_line", "HV Lines", "#c44e52", 4.0),
+            ("lv_line", "LV ABCN Lines", "#222222", 3.0),
+            ("service_drop", "Service Drops", "#ff7f00", 2.2),
+        ):
+            subset = planned_lines.loc[planned_lines["line_type"] == line_type]
+            lines.extend(
+                _build_line_overlays(
+                    gdf=subset,
+                    dtm=dtm,
+                    profile=profile,
+                    label=label,
+                    color=color,
+                    width=width,
+                    z_offset=line_offset * 1.45,
+                )
+            )
+    else:
+        lines.extend(
+            _build_line_overlays(
+                gdf=planned_lines,
+                dtm=dtm,
+                profile=profile,
+                label="Planned Lines",
+                color="#f3a712",
+                width=3.2,
+                z_offset=line_offset * 1.45,
+            )
+        )
+
+    points.extend(
+        _build_user_point_overlays(
+            users=users,
             dtm=dtm,
             profile=profile,
-            label="Planned Lines",
-            color="#f3a712",
-            width=3.2,
-            z_offset=line_offset * 1.45,
+            z_offset=point_offset,
         )
     )
 
-    user_points = _build_point_overlay(
-        gdf=users,
+    transformer_points = _build_point_overlay(
+        gdf=transformer,
         dtm=dtm,
         profile=profile,
-        label="Users",
-        color="#000000",
-        size=3.0,
-        z_offset=point_offset,
-        text_column="user_id",
-        text_prefix="user_id",
+        label="Transformer",
+        color="#d7191c",
+        size=5.0,
+        z_offset=point_offset * 1.8,
+        text_column="transformer_id",
+        text_prefix="transformer",
+        marker="s",
+        plotly_symbol="square",
     )
-    if user_points is not None:
-        points.append(user_points)
+    if transformer_points is not None:
+        points.append(transformer_points)
+
+    if poles is not None and not poles.empty and "pole_type" in poles.columns:
+        for pole_type, label, color, marker, symbol, size in (
+            ("hv_pole", "HV Poles", "#7b1fa2", "^", "x", 4.6),
+            ("hv_lv_shared", "Shared HV/LV Poles", "#ad8b00", "s", "square", 4.8),
+            ("lv_pole", "LV Poles", "#00c7d9", "D", "diamond", 3.8),
+            ("clearance_repair", "Clearance Repair Poles", "#ff5ea8", "P", "cross", 4.8),
+        ):
+            subset = poles.loc[poles["pole_type"] == pole_type].copy()
+            if subset.empty:
+                continue
+            subset["render_z_m"] = subset["elev_m"].astype(np.float32) + subset["pole_height_m"].astype(np.float32)
+            pole_points = _build_point_overlay(
+                gdf=subset,
+                dtm=dtm,
+                profile=profile,
+                label=label,
+                color=color,
+                size=size,
+                z_offset=0.0,
+                text_column="pole_id",
+                text_prefix="pole",
+                marker=marker,
+                plotly_symbol=symbol,
+                z_column="render_z_m",
+            )
+            if pole_points is not None:
+                points.append(pole_points)
+    else:
+        pole_points = _build_point_overlay(
+            gdf=poles,
+            dtm=dtm,
+            profile=profile,
+            label="Poles",
+            color="#00c7d9",
+            size=3.6,
+            z_offset=point_offset * 1.4,
+            text_column="pole_id",
+            text_prefix="pole",
+            marker="^",
+            plotly_symbol="diamond",
+        )
+        if pole_points is not None:
+            points.append(pole_points)
 
     return lines, points
 
@@ -294,7 +376,7 @@ def _save_matplotlib_surface(
             point.z,
             color=point.color,
             s=(point.size * 2) ** 2,
-            marker="o",
+            marker=point.marker,
             depthshade=False,
             edgecolors="white",
             linewidths=0.5,
@@ -398,7 +480,7 @@ def _save_plotly_surface(
                 marker={
                     "size": point.size,
                     "color": point.color,
-                    "symbol": "circle",
+                    "symbol": point.plotly_symbol,
                     "line": {"color": "white", "width": 0.5},
                 },
                 text=point.text,
@@ -443,6 +525,31 @@ def _build_line_overlays(
         return []
 
     overlays: list[OverlayLine3D] = []
+    if "support_z_start_m" in gdf.columns and "support_z_end_m" in gdf.columns:
+        for row in gdf.itertuples():
+            geometry = row.geometry
+            for coords in _iter_line_coordinate_sequences(geometry):
+                simplified = _thin_coordinates(coords, max_points=240)
+                xs = simplified[:, 0].astype(np.float32)
+                ys = simplified[:, 1].astype(np.float32)
+                if len(xs) <= 1:
+                    continue
+                fractions = np.linspace(0.0, 1.0, len(xs), dtype=np.float32)
+                z_start = float(getattr(row, "support_z_start_m", 0.0))
+                z_end = float(getattr(row, "support_z_end_m", 0.0))
+                zs = (z_start + (z_end - z_start) * fractions).astype(np.float32)
+                overlays.append(
+                    OverlayLine3D(
+                        label=label,
+                        x=xs,
+                        y=ys,
+                        z=zs,
+                        color=color,
+                        width=width,
+                    )
+                )
+        return overlays
+
     for geometry in gdf.geometry:
         for coords in _iter_line_coordinate_sequences(geometry):
             simplified = _thin_coordinates(coords, max_points=240)
@@ -473,6 +580,9 @@ def _build_point_overlay(
     z_offset: float,
     text_column: str | None = None,
     text_prefix: str | None = None,
+    marker: str = "o",
+    plotly_symbol: str = "circle",
+    z_column: str | None = None,
 ) -> OverlayPoint3D | None:
     """Convert a point layer into a terrain-aware 3D point overlay."""
 
@@ -481,7 +591,9 @@ def _build_point_overlay(
 
     xs = gdf.geometry.x.to_numpy(dtype=np.float32)
     ys = gdf.geometry.y.to_numpy(dtype=np.float32)
-    if "elev_m" in gdf.columns:
+    if z_column is not None and z_column in gdf.columns:
+        base_z = gdf[z_column].to_numpy(dtype=np.float32)
+    elif "elev_m" in gdf.columns:
         base_z = gdf["elev_m"].to_numpy(dtype=np.float32)
     else:
         base_z = _sample_surface_elevation(xs=xs, ys=ys, dtm=dtm, profile=profile)
@@ -500,8 +612,65 @@ def _build_point_overlay(
         z=zs.astype(np.float32),
         color=color,
         size=size,
+        marker=marker,
+        plotly_symbol=plotly_symbol,
         text=text,
     )
+
+
+def _build_user_point_overlays(
+    *,
+    users: gpd.GeoDataFrame | None,
+    dtm: np.ndarray,
+    profile: dict[str, Any],
+    z_offset: float,
+) -> list[OverlayPoint3D]:
+    """Build user overlays, separating assigned phases when available."""
+
+    if users is None or users.empty:
+        return []
+
+    if "assigned_phase" not in users.columns or users["assigned_phase"].fillna("").eq("").all():
+        overlay = _build_point_overlay(
+            gdf=users,
+            dtm=dtm,
+            profile=profile,
+            label="Users",
+            color="#111111",
+            size=3.4,
+            z_offset=z_offset,
+            text_column="user_id",
+            text_prefix="user_id",
+            marker="o",
+            plotly_symbol="circle",
+        )
+        return [overlay] if overlay is not None else []
+
+    overlays: list[OverlayPoint3D] = []
+    phase_styles = {
+        "A": ("Users-A", "#ffd400"),
+        "B": ("Users-B", "#2ca25f"),
+        "C": ("Users-C", "#e53935"),
+        "ABC": ("Users-ABC", "#984ea3"),
+    }
+    for phase, (label, color) in phase_styles.items():
+        subset = users.loc[users["assigned_phase"] == phase]
+        overlay = _build_point_overlay(
+            gdf=subset,
+            dtm=dtm,
+            profile=profile,
+            label=label,
+            color=color,
+            size=3.8 if phase != "ABC" else 4.2,
+            z_offset=z_offset,
+            text_column="user_id",
+            text_prefix="user_id",
+            marker="o",
+            plotly_symbol="circle",
+        )
+        if overlay is not None:
+            overlays.append(overlay)
+    return overlays
 
 
 def _iter_line_coordinate_sequences(geometry: Any):

@@ -20,10 +20,12 @@ from src.io.vector_io import (
     read_layer,
 )
 from src.planning.cost_surface import build_cost_surface
+from src.planning.optimizer import optimize_distribution_network
 from src.terrain.terrain_derivatives import derive_terrain_layers
 from src.terrain.terrain_generator import generate_terrain
 from src.terrain.terrain_validator import terrain_statistics, validate_terrain_array
 from src.viz.plot_scene import generate_scene_plots
+from src.viz.plot_optimized_plan import generate_optimized_plan_plots
 from src.viz.plot_terrain_3d import generate_terrain_3d_previews
 
 
@@ -33,7 +35,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Distribution scene generator")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    for command in ("generate-scene", "derive-terrain", "plot-scene", "plot-terrain-3d"):
+    for command in (
+        "generate-scene",
+        "derive-terrain",
+        "plot-scene",
+        "plot-terrain-3d",
+        "optimize-plan",
+        "plot-plan",
+    ):
         command_parser = subparsers.add_parser(command)
         command_parser.add_argument(
             "--config",
@@ -76,6 +85,10 @@ def main() -> None:
         plot_scene(config=config, project_root=project_root)
     elif args.command == "plot-terrain-3d":
         plot_terrain_3d(config=config, project_root=project_root)
+    elif args.command == "optimize-plan":
+        optimize_plan(config=config, project_root=project_root)
+    elif args.command == "plot-plan":
+        plot_plan(config=config, project_root=project_root)
     elif args.command == "refresh-manual":
         refresh_manual(
             config=config,
@@ -285,6 +298,90 @@ def plot_terrain_3d(*, config: dict[str, Any], project_root: Path) -> dict[str, 
     return paths
 
 
+def optimize_plan(*, config: dict[str, Any], project_root: Path) -> dict[str, Path]:
+    """Run the 3D distribution-network optimizer and write plan outputs."""
+
+    paths = resolve_paths(project_root)
+    dtm, profile = read_geotiff(paths["dtm"])
+    slope, _ = read_geotiff(paths["slope"])
+    roughness, _ = read_geotiff(paths["roughness"])
+    buildable_mask, _ = read_geotiff(paths["buildable_mask"])
+
+    users = _read_or_empty(paths["features"], "users")
+    forest = _read_or_empty(paths["features"], "forest")
+    water = _read_or_empty(paths["features"], "water")
+    manual = _read_or_empty(paths["features"], "manual_no_build")
+    forbidden_mask = rasterize_forbidden_mask(
+        profile=profile,
+        forest=forest,
+        water=water,
+        manual_no_build=manual,
+    )
+    buildable_mask = ((buildable_mask > 0) & (forbidden_mask == 0)).astype("uint8")
+    write_geotiff(paths["forbidden_mask"], forbidden_mask, profile)
+    write_geotiff(paths["buildable_mask"], buildable_mask, profile)
+
+    optimized = optimize_distribution_network(
+        config=config,
+        dtm=dtm,
+        slope=slope,
+        roughness=roughness,
+        buildable_mask=buildable_mask,
+        forbidden_mask=forbidden_mask,
+        profile=profile,
+        users=users,
+    )
+
+    overwrite_layer(paths["features"], "users", optimized.users)
+    overwrite_layer(paths["features"], "candidate_transformer", optimized.transformer)
+    overwrite_layer(paths["features"], "candidate_poles", optimized.poles)
+    overwrite_layer(paths["features"], "planned_lines", optimized.planned_lines)
+    write_json(paths["optimization_summary"], optimized.summary)
+
+    generate_optimized_plan_plots(
+        dtm=dtm,
+        profile=profile,
+        users=optimized.users,
+        forest=forest,
+        water=water,
+        manual_no_build=manual,
+        transformer=optimized.transformer,
+        poles=optimized.poles,
+        planned_lines=optimized.planned_lines,
+        output_dir=paths["plots"],
+        visualization_config=config.get("visualization", {}),
+    )
+    return paths
+
+
+def plot_plan(*, config: dict[str, Any], project_root: Path) -> dict[str, Path]:
+    """Regenerate optimized-plan visualization from existing output layers."""
+
+    paths = resolve_paths(project_root)
+    dtm, profile = read_geotiff(paths["dtm"])
+    users = _read_or_empty(paths["features"], "users")
+    forest = _read_or_empty(paths["features"], "forest")
+    water = _read_or_empty(paths["features"], "water")
+    manual = _read_or_empty(paths["features"], "manual_no_build")
+    transformer = _read_or_empty(paths["features"], "candidate_transformer")
+    poles = _read_or_empty(paths["features"], "candidate_poles")
+    planned_lines = _read_or_empty(paths["features"], "planned_lines")
+    generate_optimized_plan_plots(
+        dtm=dtm,
+        profile=profile,
+        users=users,
+        forest=forest,
+        water=water,
+        manual_no_build=manual,
+        transformer=transformer,
+        poles=poles,
+        planned_lines=planned_lines,
+        output_dir=paths["plots"],
+        visualization_config=config.get("visualization", {}),
+    )
+    return paths
+
+
 def refresh_manual(
     *,
     config: dict[str, Any],
@@ -347,6 +444,7 @@ def resolve_paths(project_root: Path) -> dict[str, Path]:
         "plots": project_root / "data/outputs/plots",
         "plans": project_root / "data/outputs/plans",
         "terrain_stats": project_root / "data/outputs/plans/terrain_stats.json",
+        "optimization_summary": project_root / "data/outputs/plans/optimization_summary.json",
     }
 
 
@@ -375,6 +473,13 @@ def write_stats(path: Path, stats: dict[str, float]) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write a JSON payload with stable UTF-8 formatting."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _read_or_empty(features_path: Path, layer: str) -> gpd.GeoDataFrame:

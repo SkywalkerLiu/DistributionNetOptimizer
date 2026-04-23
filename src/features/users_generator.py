@@ -8,7 +8,7 @@ from rasterio.transform import Affine
 from shapely.geometry import Point
 
 
-PHASE_TYPES = ("A", "B", "C", "ABC")
+PHASE_TYPES = ("single", "three_phase", "A", "B", "C", "ABC")
 
 
 def generate_users(
@@ -23,7 +23,7 @@ def generate_users(
 
     users_cfg = config["users"]
     scene_cfg = config["scene"]
-    count = int(users_cfg["count"])
+    count = _resolve_user_count(users_cfg)
     min_spacing_m = float(users_cfg["min_spacing_m"])
     distribution_mode = str(users_cfg.get("distribution_mode", "uniform"))
     cluster_count = max(1, int(users_cfg.get("cluster_count", 3)))
@@ -81,12 +81,19 @@ def generate_users(
             "Relax spacing or expand the valid mask."
         )
 
-    load_low, load_high = map(float, users_cfg["load_kw_range"])
+    load_kw, power_factor, phase_type = _build_load_profile(
+        users_cfg=users_cfg,
+        count=count,
+        rng=rng,
+    )
     importance_low, importance_high = map(int, users_cfg["importance_range"])
     data = {
         "user_id": np.arange(1, count + 1, dtype=np.int64),
-        "load_kw": rng.uniform(load_low, load_high, size=count).round(3),
-        "phase_type": rng.choice(PHASE_TYPES, size=count, replace=True),
+        "load_kw": load_kw,
+        "power_factor": power_factor,
+        "phase_type": phase_type,
+        "assigned_phase": np.full(count, "", dtype=object),
+        "apparent_kva": np.round(load_kw / np.maximum(power_factor, 0.001), 3),
         "importance": rng.integers(
             importance_low,
             importance_high + 1,
@@ -101,10 +108,65 @@ def generate_users(
     return gpd.GeoDataFrame(data, geometry=geometries, crs=crs)
 
 
+def _resolve_user_count(users_cfg: dict[str, Any]) -> int:
+    """Resolve the number of users, preferring explicit load groups when present."""
+
+    load_groups = users_cfg.get("load_groups")
+    if load_groups:
+        return int(sum(int(group["count"]) for group in load_groups))
+    return int(users_cfg["count"])
+
+
+def _build_load_profile(
+    *,
+    users_cfg: dict[str, Any],
+    count: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build per-user load, power-factor, and phase-type arrays."""
+
+    load_groups = users_cfg.get("load_groups")
+    if load_groups:
+        loads: list[float] = []
+        power_factors: list[float] = []
+        phase_types: list[str] = []
+        for group in load_groups:
+            group_count = int(group["count"])
+            loads.extend([float(group["load_kw"])] * group_count)
+            power_factors.extend([float(group.get("power_factor", 0.85))] * group_count)
+            phase_types.extend([str(group.get("phase_type", "single"))] * group_count)
+
+        if len(loads) != count:
+            raise ValueError("load_groups count does not match resolved user count.")
+
+        order = rng.permutation(count)
+        return (
+            np.asarray(loads, dtype=np.float64)[order],
+            np.asarray(power_factors, dtype=np.float64)[order],
+            np.asarray(phase_types, dtype=object)[order],
+        )
+
+    load_low, load_high = map(float, users_cfg.get("load_kw_range", [12.0, 12.0]))
+    pf_low, pf_high = map(float, users_cfg.get("power_factor_range", [0.85, 0.85]))
+    default_phase_type = str(users_cfg.get("default_phase_type", "single"))
+
+    load_kw = rng.uniform(load_low, load_high, size=count).round(3)
+    power_factor = rng.uniform(pf_low, pf_high, size=count).round(3)
+    phase_distribution = users_cfg.get("phase_type_distribution")
+    if phase_distribution:
+        phase_names = np.asarray(list(phase_distribution.keys()), dtype=object)
+        weights = np.asarray(list(phase_distribution.values()), dtype=np.float64)
+        weights = weights / weights.sum()
+        phase_type = rng.choice(phase_names, size=count, replace=True, p=weights)
+    else:
+        phase_type = np.full(count, default_phase_type, dtype=object)
+
+    return load_kw, power_factor, phase_type
+
+
 def _cell_center(transform: Affine, *, row: int, col: int) -> tuple[float, float]:
     """Convert raster row and column indices into cell-center coordinates."""
 
     x = float(transform.c + (col + 0.5) * transform.a)
     y = float(transform.f + (row + 0.5) * transform.e)
     return x, y
-

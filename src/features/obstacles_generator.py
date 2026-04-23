@@ -79,11 +79,10 @@ def rasterize_forbidden_mask(
     """Rasterize the forbidden zones into a binary mask."""
 
     forbidden_shapes = []
-    if not forest.empty and "forbidden" in forest.columns:
-        forbidden_forest = forest.loc[forest["forbidden"] == 1]
+    if not forest.empty:
         forbidden_shapes.extend(
             (geom, 1)
-            for geom in forbidden_forest.geometry
+            for geom in forest.geometry
             if geom and not geom.is_empty
         )
     forbidden_shapes.extend((geom, 1) for geom in water.geometry if geom and not geom.is_empty)
@@ -144,7 +143,7 @@ def _make_obstacle_layer(
                     "obs_id": obs_id,
                     "density": density,
                     "pass_cost": round(1.2 + density * 3.2, 3),
-                    "forbidden": int(rng.random() < 0.35),
+                    "forbidden": 1,
                 }
             )
         elif kind == "water":
