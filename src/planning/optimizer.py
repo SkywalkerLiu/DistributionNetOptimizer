@@ -76,7 +76,6 @@ def optimize_distribution_network(
         profile=profile,
         users=users,
     )
-    source_node = _source_node(config=config, dtm=dtm, profile=profile)
     route_context = _build_routing_graph(
         config=config,
         dtm=dtm,
@@ -85,26 +84,17 @@ def optimize_distribution_network(
         buildable_mask=buildable_mask,
         forbidden_mask=forbidden_mask,
         profile=profile,
-        source_node=source_node,
         transformer_node=transformer_node,
         users=users,
     )
 
     _attach_standard_terminals(
         context=route_context,
-        source_node=source_node,
         transformer_node=transformer_node,
         users=users,
         blocked_mask=blocked_mask,
         profile=profile,
         config=config,
-    )
-    hv_path = _shortest_path_or_diagnostic(
-        graph=route_context.graph,
-        source=source_node["node_id"],
-        target=transformer_node["node_id"],
-        diagnostics=diagnostics,
-        label="high-voltage source to transformer",
     )
     low_tree = _build_low_voltage_tree(
         context=route_context,
@@ -115,16 +105,6 @@ def optimize_distribution_network(
         profile=profile,
         config=config,
         diagnostics=diagnostics,
-    )
-    hv_path = _expand_path_with_supports(
-        context=route_context,
-        path=hv_path,
-        line_type="hv_line",
-        dtm=dtm,
-        buildable_mask=buildable_mask,
-        forbidden_mask=forbidden_mask,
-        profile=profile,
-        config=config,
     )
     low_tree = _expand_tree_with_supports(
         context=route_context,
@@ -170,7 +150,6 @@ def optimize_distribution_network(
     pole_layer, pole_id_by_node = _build_pole_layer(
         context=route_context,
         low_tree=low_tree,
-        hv_path=hv_path,
         slope=slope,
         profile=profile,
         config=config,
@@ -179,7 +158,6 @@ def optimize_distribution_network(
     planned_lines = _build_line_layer(
         context=route_context,
         low_tree=low_tree,
-        hv_path=hv_path,
         root=transformer_node["node_id"],
         pole_id_by_node=pole_id_by_node,
         electrical=electrical,
@@ -218,34 +196,29 @@ def optimize_distribution_network(
 def _attach_standard_terminals(
     *,
     context: _RoutingContext,
-    source_node: dict[str, Any],
     transformer_node: dict[str, Any],
     users: gpd.GeoDataFrame,
     blocked_mask: np.ndarray,
     profile: dict[str, Any],
     config: dict[str, Any],
 ) -> None:
-    """Attach source/transformer to the route graph and register user terminals."""
+    """Attach transformer to the route graph and register user terminals."""
 
     planning_cfg = config["planning"]
     sample_step = float(planning_cfg.get("forbidden_edge_sample_step_m", 5.0))
     max_span = float(planning_cfg.get("max_pole_span_m", 50.0))
-    for node, kind, distance in (
-        (source_node, "source", max_span),
-        (transformer_node, "transformer", max_span),
-    ):
-        _add_terminal_node(
-            context=context,
-            node_id=node["node_id"],
-            x=node["x"],
-            y=node["y"],
-            z=node["z"],
-            kind=kind,
-            max_connect_m=distance,
-            blocked_mask=blocked_mask,
-            profile=profile,
-            sample_step_m=sample_step,
-        )
+    _add_terminal_node(
+        context=context,
+        node_id=transformer_node["node_id"],
+        x=transformer_node["x"],
+        y=transformer_node["y"],
+        z=transformer_node["z"],
+        kind="transformer",
+        max_connect_m=max_span,
+        blocked_mask=blocked_mask,
+        profile=profile,
+        sample_step_m=sample_step,
+    )
     for row in users.itertuples():
         _register_terminal_node(
             context=context,
@@ -324,13 +297,11 @@ def _select_transformer(
     user_x = users.geometry.x.to_numpy(dtype=np.float64)
     user_y = users.geometry.y.to_numpy(dtype=np.float64)
     weights = users["apparent_kva"].to_numpy(dtype=np.float64)
-    source_x, source_y = _source_xy(config=config, profile=profile)
     dist_to_users = np.sqrt((xs[:, None] - user_x[None, :]) ** 2 + (ys[:, None] - user_y[None, :]) ** 2)
     weighted_distance = (dist_to_users * weights[None, :]).sum(axis=1) / max(float(weights.sum()), 1.0)
-    hv_distance = np.hypot(xs - source_x, ys - source_y)
     slope_score = slope[rows, cols] / max(float(np.percentile(slope, 95)), 1.0)
     roughness_score = roughness[rows, cols] / max(float(np.percentile(roughness, 95)), 1.0)
-    score = weighted_distance + 0.35 * hv_distance + 25.0 * slope_score + 15.0 * roughness_score
+    score = weighted_distance + 25.0 * slope_score + 15.0 * roughness_score
     best = int(np.argmin(score))
     best_row = int(rows[best])
     best_col = int(cols[best])
@@ -348,12 +319,10 @@ def _select_transformer(
             (refine_xs[:, None] - user_x[None, :]) ** 2 + (refine_ys[:, None] - user_y[None, :]) ** 2
         )
         refine_weighted_distance = (refine_dist_to_users * weights[None, :]).sum(axis=1) / max(float(weights.sum()), 1.0)
-        refine_hv_distance = np.hypot(refine_xs - source_x, refine_ys - source_y)
         refine_slope_score = slope[refine_rows, refine_cols] / max(float(np.percentile(slope, 95)), 1.0)
         refine_roughness_score = roughness[refine_rows, refine_cols] / max(float(np.percentile(roughness, 95)), 1.0)
         refine_score = (
             refine_weighted_distance
-            + 0.35 * refine_hv_distance
             + 25.0 * refine_slope_score
             + 15.0 * refine_roughness_score
         )
@@ -375,36 +344,6 @@ def _select_transformer(
     }
 
 
-def _source_node(
-    *,
-    config: dict[str, Any],
-    dtm: np.ndarray,
-    profile: dict[str, Any],
-) -> dict[str, Any]:
-    """Build the configured high-voltage source terminal."""
-
-    x, y = _source_xy(config=config, profile=profile)
-    return {"node_id": "SOURCE", "x": x, "y": y, "z": _sample_array(dtm, profile, x, y)}
-
-
-def _source_xy(
-    *,
-    config: dict[str, Any],
-    profile: dict[str, Any],
-) -> tuple[float, float]:
-    """Return configured source XY, defaulting to the left-middle boundary."""
-
-    planning_cfg = config.get("planning", {})
-    if "source_point_xy" in planning_cfg:
-        x, y = planning_cfg["source_point_xy"]
-        return float(x), float(y)
-    transform = profile["transform"]
-    left = float(transform.c)
-    top = float(transform.f)
-    bottom = top + float(profile["height"]) * float(transform.e)
-    return left, (top + bottom) / 2.0
-
-
 def _build_routing_graph(
     *,
     config: dict[str, Any],
@@ -414,7 +353,6 @@ def _build_routing_graph(
     buildable_mask: np.ndarray,
     forbidden_mask: np.ndarray,
     profile: dict[str, Any],
-    source_node: dict[str, Any] | None = None,
     transformer_node: dict[str, Any] | None = None,
     users: gpd.GeoDataFrame | None = None,
 ) -> _RoutingContext:
@@ -435,7 +373,6 @@ def _build_routing_graph(
         passable=passable,
         profile=profile,
         stride=stride,
-        source_node=source_node,
         transformer_node=transformer_node,
         users=users,
         config=config,
@@ -489,7 +426,6 @@ def _collect_route_anchor_cells(
     passable: np.ndarray,
     profile: dict[str, Any],
     stride: int,
-    source_node: dict[str, Any] | None,
     transformer_node: dict[str, Any] | None,
     users: gpd.GeoDataFrame | None,
     config: dict[str, Any],
@@ -519,8 +455,6 @@ def _collect_route_anchor_cells(
 
     point_specs: list[tuple[float, float, int]] = []
     local_radius = max(1, stride)
-    if source_node is not None:
-        point_specs.append((float(source_node["x"]), float(source_node["y"]), local_radius))
     if transformer_node is not None:
         point_specs.append((float(transformer_node["x"]), float(transformer_node["y"]), local_radius))
     if users is not None and not users.empty:
@@ -812,6 +746,7 @@ def _build_low_voltage_tree(
 
     planning_cfg = config["planning"]
     service_cost_per_m = float(planning_cfg.get("service_line_cost_per_m", 35.0))
+    voltage_drop_weight = float(planning_cfg.get("voltage_drop_optimization_weight", 0.5))
     lv_graph = graph.copy()
     if "SOURCE" in lv_graph:
         lv_graph.remove_node("SOURCE")
@@ -856,6 +791,12 @@ def _build_low_voltage_tree(
             backbone_nodes=backbone_nodes,
             candidates=candidates,
             service_cost_per_m=service_cost_per_m,
+            user_kva=float(row.apparent_kva),
+            root=root,
+            root_lengths=root_lengths,
+            voltage_drop_weight=voltage_drop_weight,
+            context=context,
+            user_geometry=row.geometry,
         )
         if best is None:
             diagnostics.append(f"User {user_id} cannot reach the shared low-voltage backbone.")
@@ -1134,11 +1075,22 @@ def _select_best_attachment_to_backbone(
     backbone_nodes: set[str],
     candidates: list[dict[str, Any]],
     service_cost_per_m: float,
+    user_kva: float,
+    root: str,
+    root_lengths: dict[str, float],
+    voltage_drop_weight: float = 0.1,
+    context: Any = None,
+    user_geometry: Any = None,
 ) -> dict[str, Any] | None:
-    """Choose the access node that adds the least new backbone plus service cost."""
+    """Choose the access node that balances cost and voltage drop."""
 
     if not candidates:
         return None
+    root_data = context.node_data[root] if context else {"x": 0, "y": 0}
+    root_x, root_y = root_data["x"], root_data["y"]
+    user_x = float(user_geometry.x) if user_geometry else 0
+    user_y = float(user_geometry.y) if user_geometry else 0
+    user_angle = math.degrees(math.atan2(user_y - root_y, user_x - root_x))
     lengths, paths = nx.multi_source_dijkstra(graph, list(backbone_nodes), weight="cost")
     best: dict[str, Any] | None = None
     best_score = float("inf")
@@ -1151,7 +1103,25 @@ def _select_best_attachment_to_backbone(
         incremental_cost = 0.0
         for from_node, to_node in zip(trimmed[:-1], trimmed[1:]):
             incremental_cost += float(graph.edges[from_node, to_node].get("cost", 0.0))
-        score = incremental_cost + float(candidate["service_length_m"]) * service_cost_per_m
+        service_cost = float(candidate["service_length_m"]) * service_cost_per_m
+        score = incremental_cost + service_cost
+        if voltage_drop_weight > 0:
+            root_distance = root_lengths.get(access_node, 0.0)
+            threshold = 120.0
+            if root_distance > threshold:
+                excess = (root_distance - threshold) / 100.0
+                vdrop_penalty = (excess ** 2) * math.sqrt(user_kva / 10.0) * voltage_drop_weight * 200.0
+                score += vdrop_penalty
+            if context and user_geometry and incremental_cost < 1e-6:
+                access_data = context.node_data.get(access_node)
+                if access_data:
+                    access_angle = math.degrees(
+                        math.atan2(access_data["y"] - root_y, access_data["x"] - root_x)
+                    )
+                    angle_diff = abs(((user_angle - access_angle + 180) % 360) - 180)
+                    if angle_diff > 45:
+                        angle_penalty = ((angle_diff - 45) / 45) ** 2 * math.sqrt(user_kva / 10.0) * voltage_drop_weight * 300.0
+                        score += angle_penalty
         if score + 1e-9 < best_score:
             best_score = score
             best = {
@@ -1159,6 +1129,8 @@ def _select_best_attachment_to_backbone(
                 "path": path,
                 "trimmed_path": trimmed,
                 "incremental_cost": incremental_cost,
+                "service_cost": service_cost,
+                "estimated_vdrop": 0.0,
                 "score": score,
             }
     return best
@@ -1251,6 +1223,7 @@ def _compute_electrical_metrics(
 
     planning_cfg = config["planning"]
     user_kva = {int(row.user_id): float(row.apparent_kva) for row in users.itertuples()}
+    user_pf = {int(row.user_id): float(row.power_factor) for row in users.itertuples()}
     assignment = {int(row.user_id): str(row.assigned_phase) for row in users.itertuples()}
     downstream = _downstream_loads(tree=tree, root=root, assignment=assignment, user_kva=user_kva)
 
@@ -1259,24 +1232,30 @@ def _compute_electrical_metrics(
     for child, par in parent.items():
         children.setdefault(par, []).append(child)
 
-    voltage_phase_v = float(planning_cfg.get("low_voltage_phase_v", 230.0))
-    resistance = float(planning_cfg.get("line_resistance_ohm_per_km", 0.642))
-    reactance = float(planning_cfg.get("line_reactance_ohm_per_km", 0.083))
-    cos_phi = float(users["power_factor"].mean()) if len(users) else 0.85
-    sin_phi = math.sqrt(max(1.0 - cos_phi**2, 0.0))
+    line_resistance = float(planning_cfg.get("line_resistance_ohm_per_km", 0.6))
+    line_reactance = float(planning_cfg.get("line_reactance_ohm_per_km", 0.35))
+    phase_voltage = float(planning_cfg.get("low_voltage_phase_v", 230.0))
+    default_pf = float(planning_cfg.get("default_power_factor", 0.85))
 
     cumulative_drop: dict[str, np.ndarray] = {root: np.zeros(3, dtype=np.float64)}
-    edge_voltage_drop_pct: dict[tuple[str, str], float] = {}
+    edge_voltage_drop_pct: dict[tuple[str, str], np.ndarray] = {}
     stack = [root]
     while stack:
         node = stack.pop()
         for child in children.get(node, []):
-            load = downstream["edge_loads"].get((node, child), np.zeros(3, dtype=np.float64))
-            current = (load * 1000.0) / max(voltage_phase_v, 1.0)
             length_km = float(tree.edges[node, child].get("length_3d_m", 0.0)) / 1000.0
-            drop_v = current * (resistance * cos_phi + reactance * sin_phi) * length_km
-            cumulative_drop[child] = cumulative_drop[node] + (drop_v / max(voltage_phase_v, 1.0) * 100.0)
-            edge_voltage_drop_pct[(node, child)] = float(cumulative_drop[child].max())
+            edge_load = downstream["edge_loads"].get((node, child), np.zeros(3, dtype=np.float64))
+            drop_pct = np.zeros(3, dtype=np.float64)
+            for phase_idx in range(3):
+                load_kva = float(edge_load[phase_idx])
+                if load_kva > 0:
+                    current_a = load_kva * 1000.0 / phase_voltage
+                    pf = default_pf
+                    sin_phi = math.sqrt(1.0 - pf * pf)
+                    voltage_drop_v = current_a * (line_resistance * pf + line_reactance * sin_phi) * length_km
+                    drop_pct[phase_idx] = (voltage_drop_v / phase_voltage) * 100.0
+            cumulative_drop[child] = cumulative_drop[node] + drop_pct
+            edge_voltage_drop_pct[(node, child)] = drop_pct.copy()
             stack.append(child)
 
     user_voltage_drop_pct: dict[int, float] = {}
@@ -1284,13 +1263,9 @@ def _compute_electrical_metrics(
     for row in users.itertuples():
         user_id = int(row.user_id)
         node_id = f"user_{user_id}"
-        phase = str(row.assigned_phase)
-        if phase == "ABC":
-            user_voltage_drop_pct[user_id] = float(cumulative_drop.get(node_id, np.zeros(3)).max())
-        else:
-            user_voltage_drop_pct[user_id] = float(
-                cumulative_drop.get(node_id, np.zeros(3))[PHASE_INDEX.get(phase, 0)]
-            )
+        phase = assignment.get(user_id, "A")
+        phase_idx = PHASE_INDEX.get(phase, 0)
+        user_voltage_drop_pct[user_id] = float(cumulative_drop.get(node_id, np.zeros(3))[phase_idx])
         user_connections[user_id] = parent.get(node_id, "")
 
     return {
@@ -1380,7 +1355,6 @@ def _build_pole_layer(
     *,
     context: _RoutingContext,
     low_tree: nx.Graph,
-    hv_path: list[str],
     slope: np.ndarray,
     profile: dict[str, Any],
     config: dict[str, Any],
@@ -1388,9 +1362,8 @@ def _build_pole_layer(
 ) -> tuple[gpd.GeoDataFrame, dict[str, str]]:
     """Create a pole point for every dynamic route node that needs one."""
 
-    hv_nodes = {node for node in hv_path if node in context.node_data and context.node_data[node]["kind"] == "grid"}
     lv_nodes = {node for node in low_tree.nodes if context.node_data[node]["kind"] == "grid"}
-    node_ids = set(hv_nodes) | set(lv_nodes)
+    node_ids = set(lv_nodes)
     rows = []
     geometries = []
     pole_id_by_node: dict[str, str] = {}
@@ -1400,18 +1373,8 @@ def _build_pole_layer(
         row, col = _xy_to_cell(profile, data["x"], data["y"], shape=slope.shape)
         pole_id = f"P{index:04d}"
         pole_id_by_node[node_id] = pole_id
-        if node_id in hv_nodes and node_id in lv_nodes:
-            pole_type = "hv_lv_shared"
-            pole_height = max(
-                float(planning_cfg.get("hv_pole_height_m", 12.0)),
-                float(planning_cfg.get("lv_pole_height_m", 10.0)),
-            )
-        elif node_id in hv_nodes:
-            pole_type = "hv_pole"
-            pole_height = float(planning_cfg.get("hv_pole_height_m", 12.0))
-        else:
-            pole_type = "lv_pole"
-            pole_height = float(planning_cfg.get("lv_pole_height_m", 10.0))
+        pole_type = "lv_pole"
+        pole_height = float(planning_cfg.get("lv_pole_height_m", 10.0))
         rows.append(
             {
                 "pole_id": pole_id,
@@ -1432,7 +1395,6 @@ def _build_line_layer(
     *,
     context: _RoutingContext,
     low_tree: nx.Graph,
-    hv_path: list[str],
     root: str,
     pole_id_by_node: dict[str, str],
     electrical: dict[str, Any],
@@ -1440,12 +1402,11 @@ def _build_line_layer(
     config: dict[str, Any],
     crs: Any,
 ) -> gpd.GeoDataFrame:
-    """Build high-voltage, low-voltage, and service-drop line records."""
+    """Build low-voltage and service-drop line records."""
 
     records: list[dict[str, Any]] = []
     geometries: list[LineString] = []
     planning_cfg = config["planning"]
-    total_load = float(users["apparent_kva"].sum())
     max_vdrop = float(planning_cfg.get("voltage_drop_max_pct", 7.0))
 
     def add_line(from_node: str, to_node: str, line_type: str, load: np.ndarray, voltage_drop_pct: float) -> None:
@@ -1455,7 +1416,7 @@ def _build_line_layer(
         support_z_start = _support_top_elevation(node_id=from_node, node_data=data_a, line_type=line_type, config=config)
         support_z_end = _support_top_elevation(node_id=to_node, node_data=data_b, line_type=line_type, config=config)
         service_phase = ""
-        phase_set = "ABC" if line_type == "hv_line" else "ABCN"
+        phase_set = "ABCN"
         if line_type == "service_drop":
             user_id = _user_id_from_edge(from_node, to_node)
             if user_id is not None:
@@ -1464,7 +1425,6 @@ def _build_line_layer(
                 phase_set = f"{service_phase}N" if service_phase in PHASES else "ABCN"
 
         line_cost_key = {
-            "hv_line": "hv_line_cost_per_m",
             "service_drop": "service_line_cost_per_m",
         }.get(line_type, "line_cost_per_m")
         is_violation = int(
@@ -1503,19 +1463,30 @@ def _build_line_layer(
         )
         geometries.append(LineString([(data_a["x"], data_a["y"]), (data_b["x"], data_b["y"])]))
 
-    hv_load = np.asarray([total_load / 3.0, total_load / 3.0, total_load / 3.0], dtype=np.float64)
-    for from_node, to_node in zip(hv_path[:-1], hv_path[1:]):
-        add_line(from_node, to_node, "hv_line", hv_load, 0.0)
-
     parent = _parent_map(low_tree, root)
     for child, par in parent.items():
         line_type = "service_drop" if child.startswith("user_") or par.startswith("user_") else "lv_line"
+        edge_drop = electrical["edge_voltage_drop_pct"].get((par, child), np.zeros(3, dtype=np.float64))
+        if line_type == "service_drop":
+            user_id = _user_id_from_edge(par, child)
+            if user_id is not None:
+                match = users.loc[users["user_id"] == user_id]
+                if not match.empty:
+                    phase = str(match.iloc[0]["assigned_phase"])
+                    phase_idx = PHASE_INDEX.get(phase, 0)
+                    voltage_drop = float(edge_drop[phase_idx])
+                else:
+                    voltage_drop = float(np.max(edge_drop))
+            else:
+                voltage_drop = float(np.max(edge_drop))
+        else:
+            voltage_drop = float(np.max(edge_drop))
         add_line(
             par,
             child,
             line_type,
             electrical["edge_loads"].get((par, child), np.zeros(3, dtype=np.float64)),
-            float(electrical["edge_voltage_drop_pct"].get((par, child), 0.0)),
+            voltage_drop,
         )
 
     gdf = gpd.GeoDataFrame(records, geometry=geometries, crs=crs)
@@ -1603,17 +1574,6 @@ def _build_support_registry(
     planning_cfg = config["planning"]
     registry: dict[str, dict[str, float | str]] = {}
 
-    source_x, source_y = _source_xy(config=config, profile=profile)
-    source_ground = _sample_array(dtm, profile, source_x, source_y)
-    registry["SOURCE"] = {
-        "node_id": "SOURCE",
-        "x": source_x,
-        "y": source_y,
-        "ground_z": source_ground,
-        "pole_height_m": float(planning_cfg.get("source_connection_height_m", 12.0)),
-        "kind": "source",
-    }
-
     for row in transformer.itertuples():
         ground = float(row.elev_m)
         registry[str(row.transformer_id)] = {
@@ -1621,12 +1581,7 @@ def _build_support_registry(
             "x": float(row.geometry.x),
             "y": float(row.geometry.y),
             "ground_z": ground,
-            "pole_height_m": float(
-                max(
-                    _transformer_connection_height(line_type="hv_line", config=config),
-                    _transformer_connection_height(line_type="lv_line", config=config),
-                )
-            ),
+            "pole_height_m": float(_transformer_connection_height(line_type="lv_line", config=config)),
             "kind": "transformer",
         }
 
@@ -1635,10 +1590,7 @@ def _build_support_registry(
             getattr(
                 row,
                 "pole_height_m",
-                max(
-                    float(planning_cfg.get("hv_pole_height_m", 13.0)),
-                    float(planning_cfg.get("lv_pole_height_m", 10.0)),
-                ),
+                float(planning_cfg.get("lv_pole_height_m", 10.0)),
             )
         )
         ground = float(row.elev_m)
@@ -1927,7 +1879,7 @@ def _create_repair_support(
                     "y": float(y),
                     "ground_z": ground_z,
                     "pole_height_m": _repair_pole_height(line_type=line_type, config=config),
-                    "pole_type": "hv_pole" if line_type == "hv_line" else "lv_pole",
+                    "pole_type": "lv_pole",
                     "kind": "pole",
                 }
                 best_distance = distance
@@ -1940,8 +1892,6 @@ def _required_clearance_m(line_type: str, config: dict[str, Any]) -> float:
     """Return the configured minimum ground clearance for a line type."""
 
     planning_cfg = config["planning"]
-    if line_type == "hv_line":
-        return float(planning_cfg.get("hv_ground_clearance_m", 6.5))
     if line_type == "service_drop":
         return float(planning_cfg.get("service_ground_clearance_m", 2.5))
     return float(planning_cfg.get("lv_ground_clearance_m", 6.0))
@@ -1958,14 +1908,10 @@ def _support_top_elevation(
 
     planning_cfg = config["planning"]
     ground = float(node_data["z"])
-    if node_id == "SOURCE":
-        return ground + float(planning_cfg.get("source_connection_height_m", 12.0))
     if node_id == "TX1":
         return ground + _transformer_connection_height(line_type=line_type, config=config)
     if str(node_id).startswith("user_"):
         return ground + float(planning_cfg.get("user_attachment_height_m", 4.0))
-    if line_type == "hv_line":
-        return ground + float(planning_cfg.get("hv_pole_height_m", 13.0))
     return ground + float(planning_cfg.get("lv_pole_height_m", 10.0))
 
 
@@ -1980,22 +1926,11 @@ def _support_top_elevation_from_support(
     planning_cfg = config["planning"]
     ground = float(support["ground_z"])
     kind = str(support.get("kind", "pole"))
-    if kind == "source":
-        return ground + float(planning_cfg.get("source_connection_height_m", 12.0))
     if kind == "transformer":
         return ground + _transformer_connection_height(line_type=line_type, config=config)
     if kind == "user":
         return ground + float(planning_cfg.get("user_attachment_height_m", 4.0))
 
-    pole_type = str(support.get("pole_type", "lv_pole"))
-    if pole_type == "hv_lv_shared":
-        return ground + (
-            float(planning_cfg.get("hv_pole_height_m", 13.0))
-            if line_type == "hv_line"
-            else float(planning_cfg.get("lv_pole_height_m", 10.0))
-        )
-    if pole_type == "hv_pole" or line_type == "hv_line":
-        return ground + float(support.get("pole_height_m", planning_cfg.get("hv_pole_height_m", 13.0)))
     return ground + float(support.get("pole_height_m", planning_cfg.get("lv_pole_height_m", 10.0)))
 
 
@@ -2003,8 +1938,6 @@ def _repair_pole_height(*, line_type: str, config: dict[str, Any]) -> float:
     """Return height for a clearance-repair support."""
 
     planning_cfg = config["planning"]
-    if line_type == "hv_line":
-        return float(planning_cfg.get("hv_pole_height_m", 13.0))
     return float(planning_cfg.get("lv_pole_height_m", 10.0))
 
 
@@ -2012,13 +1945,6 @@ def _transformer_connection_height(*, line_type: str, config: dict[str, Any]) ->
     """Return transformer-side conductor attachment height by line type."""
 
     planning_cfg = config["planning"]
-    if line_type == "hv_line":
-        return float(
-            planning_cfg.get(
-                "transformer_hv_connection_height_m",
-                planning_cfg.get("transformer_connection_height_m", planning_cfg.get("hv_pole_height_m", 13.0)),
-            )
-        )
     return float(
         planning_cfg.get(
             "transformer_lv_connection_height_m",

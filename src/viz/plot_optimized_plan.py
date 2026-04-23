@@ -20,8 +20,6 @@ from src.viz.plot_terrain_3d import generate_terrain_3d_previews
 
 PHASE_COLORS = {"A": "#ffd400", "B": "#2ca25f", "C": "#e53935", "ABC": "#984ea3", "": "#777777"}
 POLE_STYLES = {
-    "hv_pole": {"color": "#7b1fa2", "marker": "^", "size": 28, "label": "HV Pole"},
-    "hv_lv_shared": {"color": "#ad8b00", "marker": "s", "size": 30, "label": "Shared HV/LV Pole"},
     "lv_pole": {"color": "#00c7d9", "marker": "D", "size": 22, "label": "LV Pole"},
     "clearance_repair": {"color": "#ff5ea8", "marker": "P", "size": 32, "label": "Clearance Repair Pole"},
 }
@@ -123,13 +121,10 @@ def _save_optimized_2d(
         Patch(facecolor="#2e7d32", edgecolor="#0b3d16", alpha=0.28, label="Forest (Forbidden)"),
         Patch(facecolor="#64b5f6", edgecolor="#0d47a1", alpha=0.32, label="Water"),
         Patch(facecolor="none", edgecolor="#e03c2a", linestyle="--", label="Manual No-Build"),
-        Line2D([0], [0], color="#c44e52", linewidth=2.4, label="HV Line"),
         Line2D([0], [0], color="#222222", linewidth=1.8, label="LV ABCN Line"),
         Line2D([0], [0], color="#ff7f00", linewidth=1.2, label="Service Drop"),
         Line2D([0], [0], marker="s", color="w", markerfacecolor="#d7191c", markeredgecolor="white", markersize=9, label="Transformer"),
-        Line2D([0], [0], marker="^", color="w", markerfacecolor=POLE_STYLES["hv_pole"]["color"], markeredgecolor="white", markersize=7, label="HV Pole"),
         Line2D([0], [0], marker="D", color="w", markerfacecolor=POLE_STYLES["lv_pole"]["color"], markeredgecolor="white", markersize=7, label="LV Pole"),
-        Line2D([0], [0], marker="s", color="w", markerfacecolor=POLE_STYLES["hv_lv_shared"]["color"], markeredgecolor="white", markersize=7, label="Shared HV/LV Pole"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor=PHASE_COLORS["A"], markeredgecolor="white", markersize=7, label="Phase A User"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor=PHASE_COLORS["B"], markeredgecolor="white", markersize=7, label="Phase B User"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor=PHASE_COLORS["C"], markeredgecolor="white", markersize=7, label="Phase C User"),
@@ -155,7 +150,6 @@ def _plot_lines_by_type(*, ax: Any, planned_lines: gpd.GeoDataFrame) -> None:
     """Plot planned lines by type and service phase."""
 
     styles = {
-        "hv_line": {"color": "#c44e52", "linewidth": 2.4, "alpha": 0.95},
         "lv_line": {"color": "#222222", "linewidth": 1.8, "alpha": 0.88},
         "service_drop": {"color": "#ff7f00", "linewidth": 1.2, "alpha": 0.85},
     }

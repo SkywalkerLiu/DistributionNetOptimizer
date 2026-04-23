@@ -6,7 +6,7 @@
 - 生成坡度、坡向、粗糙度、可建设区、基础成本栅格
 - 随机生成用户、树林、水区、人工禁区
 - 将结果统一写入 `GeoPackage`
-- 基于三维地形执行配变选址、10kV 高压放射式接入、380V 低压径向网络规划
+- 基于三维地形执行配变选址、380V 低压径向网络规划
 - 进行 ABC 相别分配、压降校核、线路净空校核
 - 输出 2D 静态图、3D 静态图、3D 动态交互图
 
@@ -27,14 +27,13 @@
 当前优化器已经实现：
 
 - 单台配变选址
-- 10kV 高压线路放射式接入
 - 低压主干 ABCN 共线路径规划
 - 连续可行域驱动的稀疏可见图路径搜索
 - 路径生成后的自动后插杆
 - 用户从杆塔分接接入
 - 单相用户 ABC 相别分配
 - 三相负荷基本平衡优化
-- 压降校核
+- 压降校核（基于负荷电流和线路阻抗精确计算）
 - 线路全线最小离地净空校核
 - 净空不足时自动增设杆塔修复
 
@@ -158,7 +157,6 @@ python -m src.main plot-plan --config configs/default_config.yaml
 - `1000m x 1000m`
 - `origin_x_m = 0`
 - `origin_y_m = 1000`
-- 默认高压电源点为 `source_point_xy: [0.0, 500.0]`
 
 ### 5.2 默认用户负荷
 
@@ -173,29 +171,32 @@ python -m src.main plot-plan --config configs/default_config.yaml
 
 为了避免杆塔过密，默认净空和高度做了适度放宽：
 
-- `hv_pole_height_m = 12.5`
 - `lv_pole_height_m = 9.5`
-- `transformer_hv_connection_height_m = 11.5`
 - `transformer_lv_connection_height_m = 8.5`
-- `source_connection_height_m = 11.5`
-- `hv_ground_clearance_m = 6.0`
 - `lv_ground_clearance_m = 4.0`
 - `service_ground_clearance_m = 2.3`
+
+### 5.4 默认线路参数
+
+压降计算和优化使用的默认参数：
+
+- `line_resistance_ohm_per_km = 0.6`（典型低压线路电阻）
+- `line_reactance_ohm_per_km = 0.35`（典型低压线路电抗）
+- `low_voltage_phase_v = 230.0`（相电压）
+- `voltage_drop_max_pct = 7.0`（允许最大压降）
+- `voltage_drop_optimization_weight = 3.0`（压降优化权重）
 
 ## 6. 优化器规则
 
 优化器实现位于 [src/planning/optimizer.py](C:/Users/LHY/Desktop/MyProject_test/DistributionNetOptimizer/src/planning/optimizer.py:1)。
 
-### 6.1 高低压分层
+### 6.1 低压网络分层
 
 当前已区分：
 
-- 高压线路：`hv_line`
 - 低压主干：`lv_line`
 - 接户线：`service_drop`
-- 高压杆：`hv_pole`
 - 低压杆：`lv_pole`
-- 高低压共杆：`hv_lv_shared`
 - 净空修复杆：`clearance_repair`
 
 ### 6.2 用户接入方式
@@ -217,7 +218,7 @@ python -m src.main plot-plan --config configs/default_config.yaml
 - 先在连续可行域外包出可通行区域
 - 在连续可行域中提取稀疏锚点
 - 用可见图方式连接线视距可达的锚点
-- 在该几何图上完成高压和低压共享主干搜索
+- 在该几何图上完成低压共享主干搜索
 - 再沿结果折线按档距自动后插杆
 - 同时优先复用已有共享主干和已有杆塔
 
@@ -258,13 +259,87 @@ python -m src.main plot-plan --config configs/default_config.yaml
 2. 自动增设杆塔。
 3. 将问题线段拆分为多段后重新校核。
 
-除了净空修复外，当前版本还会在高压和低压共享主干折线上执行“后插杆”：
+当前版本会在低压共享主干折线上执行"后插杆"：
 
 1. 路径先按几何折线求出。
 2. 若某段平面跨度超过档距上限，则沿该段自动增设中间杆塔。
 3. 再对拆分后的线段继续做净空和电气校核。
 
 如果仍无法满足，则该段会被标记为违规，并写入汇总结果。
+
+### 6.6 压降计算
+
+压降计算采用基于负荷电流和线路阻抗的精确方法：
+
+**计算公式：**
+
+```
+ΔU% = (I × (R × cosφ + X × sinφ) × L × 100) / V
+```
+
+其中：
+- `I` = 电流（A）= S(kVA) × 1000 / V_phase
+- `R` = 线路电阻（Ω/km），默认 0.6 Ω/km
+- `X` = 线路电抗（Ω/km），默认 0.35 Ω/km
+- `L` = 线路长度（km）
+- `V` = 相电压（230V）
+- `cosφ` = 功率因数（默认 0.85）
+
+**计算逻辑：**
+
+1. 从变压器出发，沿树形网络向下遍历
+2. 每段线路的压降由该段承载的下游负荷决定
+3. 用户总压降 = 从变压器到用户的所有线路段压降之和
+4. 上游用户的负荷会影响下游所有用户的压降
+
+**配置参数：**
+
+- `line_resistance_ohm_per_km`：线路电阻（Ω/km）
+- `line_reactance_ohm_per_km`：线路电抗（Ω/km）
+- `low_voltage_phase_v`：相电压（V）
+- `voltage_drop_max_pct`：允许最大压降百分比
+- `voltage_drop_optimization_weight`：压降优化权重（默认 0.5）
+
+### 6.7 压降优化目标
+
+除了将压降作为约束条件外，优化器还将**平均压降最小化**纳入优化目标：
+
+**优化目标函数：**
+
+```
+Score = 成本 + w × 压降惩罚
+```
+
+**压降惩罚公式：**
+
+```
+if distance > 120m:
+    vdrop_penalty = ((distance - 120) / 100)² × √(S/10) × w × 200
+else:
+    vdrop_penalty = 0
+```
+
+其中：
+- **distance** = 配变到接入点的距离（m）
+- **S** = 用户视在功率（kVA）
+- **w** = `voltage_drop_optimization_weight`（默认 3.0）
+- **阈值** = 120m（低于此值不惩罚）
+
+**优化策略：**
+
+1. **距离压降惩罚**：配变到接入点 > 120m 时，按平方增长施加惩罚
+2. **角度差异惩罚**（关键改进）：当用户"接入已有主干"时，计算用户方向与接入点方向的夹角
+   - 夹角 ≤ 45°：无额外惩罚（顺路共享）
+   - 夹角 45°-90°：中等惩罚（需要绕路）
+   - 夹角 > 90°：强惩罚（严重绕路，应建立新分支）
+3. **效果**：自然形成辐射状网络，每个方向的用户倾向于独立分支
+
+**效果：**
+
+- 避免远端用户通过超长路径串联接入
+- 鼓励为远离主负荷中心（> 400m）的用户群建立独立分支
+- 保持同区域内用户的共享接入行为
+- 权重越大，越倾向于生成多条独立短路径
 
 ## 7. GeoPackage 图层
 
@@ -324,15 +399,12 @@ python -m src.main plot-plan --config configs/default_config.yaml
 
 ### 8.2 线路颜色
 
-- `hv_line`：红褐色
 - `lv_line`：深灰色
 - `service_drop`：橙色
 
 ### 8.3 杆塔颜色
 
-- `hv_pole`：紫色
 - `lv_pole`：青色
-- `hv_lv_shared`：金黄色
 - `clearance_repair`：粉色
 
 ### 8.4 3D 图形显示

@@ -60,28 +60,21 @@ planning:
   max_loading_ratio: 1.0
   transformer_fixed_cost: 120000.0
   pole_fixed_cost: 1800.0
-  hv_pole_height_m: 12.5
   lv_pole_height_m: 9.5
-  transformer_hv_connection_height_m: 11.5
   transformer_lv_connection_height_m: 8.5
-  source_connection_height_m: 11.5
   user_attachment_height_m: 4.0
   line_cost_per_m: 55.0
   service_line_cost_per_m: 35.0
-  hv_line_cost_per_m: 120.0
   max_pole_span_m: 50.0
   max_service_drop_m: 25.0
-  source_point_xy: [0.0, 120.0]
   phase_balance_target_ratio: 0.10
   phase_balance_max_ratio: 0.15
   low_voltage_phase_v: 230.0
   low_voltage_line_v: 400.0
   voltage_drop_max_pct: 7.0
-  voltage_drop_single_phase_upper_pct: 7.0
-  voltage_drop_single_phase_lower_pct: -10.0
-  line_resistance_ohm_per_km: 0.642
-  line_reactance_ohm_per_km: 0.083
-  hv_ground_clearance_m: 6.0
+  voltage_drop_optimization_weight: 0.5
+  line_resistance_ohm_per_km: 0.6
+  line_reactance_ohm_per_km: 0.35
   lv_ground_clearance_m: 4.0
   service_ground_clearance_m: 2.3
   clearance_sample_step_m: 2.0

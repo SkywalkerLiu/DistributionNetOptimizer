@@ -71,8 +71,8 @@ def test_generate_terrain_3d_previews_writes_png_and_html() -> None:
     poles = gpd.GeoDataFrame(
         {
             "pole_id": ["P0001", "P0002"],
-            "pole_type": ["hv_pole", "lv_pole"],
-            "pole_height_m": [12.5, 9.5],
+            "pole_type": ["lv_pole", "lv_pole"],
+            "pole_height_m": [9.5, 9.5],
             "elev_m": [22.0, 35.0],
         },
         geometry=[Point(20.0, 30.0), Point(55.0, 50.0)],
@@ -101,7 +101,6 @@ def test_generate_terrain_3d_previews_writes_png_and_html() -> None:
     assert "Forest" in html
     assert "Water" in html
     assert "Manual No-Build" in html
-    assert "HV Poles" in html
     assert "LV Poles" in html
 
     shutil.rmtree(tmp_path, ignore_errors=True)

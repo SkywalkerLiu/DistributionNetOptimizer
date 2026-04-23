@@ -226,7 +226,6 @@ def build_scene_3d_overlays(
     )
     if planned_lines is not None and not planned_lines.empty and "line_type" in planned_lines.columns:
         for line_type, label, color, width in (
-            ("hv_line", "HV Lines", "#c44e52", 4.0),
             ("lv_line", "LV ABCN Lines", "#222222", 3.0),
             ("service_drop", "Service Drops", "#ff7f00", 2.2),
         ):
@@ -282,8 +281,6 @@ def build_scene_3d_overlays(
 
     if poles is not None and not poles.empty and "pole_type" in poles.columns:
         for pole_type, label, color, marker, symbol, size in (
-            ("hv_pole", "HV Poles", "#7b1fa2", "^", "x", 4.6),
-            ("hv_lv_shared", "Shared HV/LV Poles", "#ad8b00", "s", "square", 4.8),
             ("lv_pole", "LV Poles", "#00c7d9", "D", "diamond", 3.8),
             ("clearance_repair", "Clearance Repair Poles", "#ff5ea8", "P", "cross", 4.8),
         ):
