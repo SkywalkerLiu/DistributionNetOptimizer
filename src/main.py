@@ -19,7 +19,6 @@ from src.io.vector_io import (
     overwrite_layer,
     read_layer,
 )
-from src.planning.candidate_generator import generate_candidate_layers
 from src.planning.cost_surface import build_cost_surface
 from src.terrain.terrain_derivatives import derive_terrain_layers
 from src.terrain.terrain_generator import generate_terrain
@@ -145,12 +144,6 @@ def generate_scene(*, config: dict[str, Any], project_root: Path) -> dict[str, P
         profile=profile,
         planning_config=config["planning"],
     )
-    candidate_transformer, candidate_poles = generate_candidate_layers(
-        config,
-        buildable_mask=terrain_layers["buildable_mask"],
-        forbidden_mask=forbidden_mask,
-        profile=profile,
-    )
 
     write_geotiff(paths["slope"], terrain_layers["slope"], profile)
     write_geotiff(paths["aspect"], terrain_layers["aspect"], profile)
@@ -164,8 +157,6 @@ def generate_scene(*, config: dict[str, Any], project_root: Path) -> dict[str, P
     overwrite_layer(paths["features"], "forest", obstacles["forest"])
     overwrite_layer(paths["features"], "water", obstacles["water"])
     overwrite_layer(paths["features"], "manual_no_build", obstacles["manual_no_build"])
-    overwrite_layer(paths["features"], "candidate_transformer", candidate_transformer)
-    overwrite_layer(paths["features"], "candidate_poles", candidate_poles)
     overwrite_layer(
         paths["features"],
         "planned_lines",
@@ -186,9 +177,18 @@ def generate_scene(*, config: dict[str, Any], project_root: Path) -> dict[str, P
             forest=obstacles["forest"],
             water=obstacles["water"],
             manual_no_build=obstacles["manual_no_build"],
-            candidate_transformer=candidate_transformer,
-            candidate_poles=candidate_poles,
             output_dir=paths["plots"],
+        )
+        generate_terrain_3d_previews(
+            dtm=dtm,
+            profile=profile,
+            output_dir=paths["plots"],
+            visualization_config=config.get("visualization", {}),
+            users=users,
+            forest=obstacles["forest"],
+            water=obstacles["water"],
+            manual_no_build=obstacles["manual_no_build"],
+            planned_lines=_read_or_empty(paths["features"], "planned_lines"),
         )
 
     return paths
@@ -223,12 +223,6 @@ def derive_terrain(*, config: dict[str, Any], project_root: Path) -> dict[str, P
         profile=profile,
         planning_config=config["planning"],
     )
-    candidate_transformer, candidate_poles = generate_candidate_layers(
-        config,
-        buildable_mask=terrain_layers["buildable_mask"],
-        forbidden_mask=forbidden_mask,
-        profile=profile,
-    )
 
     write_geotiff(paths["slope"], terrain_layers["slope"], profile)
     write_geotiff(paths["aspect"], terrain_layers["aspect"], profile)
@@ -236,8 +230,6 @@ def derive_terrain(*, config: dict[str, Any], project_root: Path) -> dict[str, P
     write_geotiff(paths["buildable_mask"], terrain_layers["buildable_mask"], profile)
     write_geotiff(paths["forbidden_mask"], forbidden_mask, profile)
     write_geotiff(paths["cost_base"], cost_base, profile)
-    overwrite_layer(paths["features"], "candidate_transformer", candidate_transformer)
-    overwrite_layer(paths["features"], "candidate_poles", candidate_poles)
     return paths
 
 
@@ -253,8 +245,6 @@ def plot_scene(*, config: dict[str, Any], project_root: Path) -> dict[str, Path]
     forest = _read_or_empty(paths["features"], "forest")
     water = _read_or_empty(paths["features"], "water")
     manual = _read_or_empty(paths["features"], "manual_no_build")
-    candidate_transformer = _read_or_empty(paths["features"], "candidate_transformer")
-    candidate_poles = _read_or_empty(paths["features"], "candidate_poles")
 
     if bool(config.get("outputs", {}).get("create_plots", True)):
         generate_scene_plots(
@@ -266,8 +256,6 @@ def plot_scene(*, config: dict[str, Any], project_root: Path) -> dict[str, Path]
             forest=forest,
             water=water,
             manual_no_build=manual,
-            candidate_transformer=candidate_transformer,
-            candidate_poles=candidate_poles,
             output_dir=paths["plots"],
         )
     return paths
@@ -282,8 +270,6 @@ def plot_terrain_3d(*, config: dict[str, Any], project_root: Path) -> dict[str, 
     forest = _read_or_empty(paths["features"], "forest")
     water = _read_or_empty(paths["features"], "water")
     manual = _read_or_empty(paths["features"], "manual_no_build")
-    candidate_transformer = _read_or_empty(paths["features"], "candidate_transformer")
-    candidate_poles = _read_or_empty(paths["features"], "candidate_poles")
     planned_lines = _read_or_empty(paths["features"], "planned_lines")
     generate_terrain_3d_previews(
         dtm=dtm,
@@ -294,8 +280,6 @@ def plot_terrain_3d(*, config: dict[str, Any], project_root: Path) -> dict[str, 
         forest=forest,
         water=water,
         manual_no_build=manual,
-        candidate_transformer=candidate_transformer,
-        candidate_poles=candidate_poles,
         planned_lines=planned_lines,
     )
     return paths

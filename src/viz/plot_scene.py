@@ -26,8 +26,6 @@ def generate_scene_plots(
     forest: gpd.GeoDataFrame,
     water: gpd.GeoDataFrame,
     manual_no_build: gpd.GeoDataFrame,
-    candidate_transformer: gpd.GeoDataFrame | None,
-    candidate_poles: gpd.GeoDataFrame | None,
     output_dir: str | Path,
 ) -> dict[str, Path]:
     """Generate all standard visualization products for the scene."""
@@ -76,8 +74,6 @@ def generate_scene_plots(
         forest=forest,
         water=water,
         manual_no_build=manual_no_build,
-        candidate_transformer=None,
-        candidate_poles=None,
     )
     _save_overlay_plot(
         background=dtm,
@@ -88,8 +84,6 @@ def generate_scene_plots(
         forest=forest,
         water=water,
         manual_no_build=manual_no_build,
-        candidate_transformer=candidate_transformer,
-        candidate_poles=candidate_poles,
     )
     return outputs
 
@@ -137,66 +131,38 @@ def _save_overlay_plot(
     forest: gpd.GeoDataFrame,
     water: gpd.GeoDataFrame,
     manual_no_build: gpd.GeoDataFrame,
-    candidate_transformer: gpd.GeoDataFrame | None,
-    candidate_poles: gpd.GeoDataFrame | None,
 ) -> None:
     """Render a terrain background with vector feature overlays."""
 
     fig, ax = plt.subplots(figsize=(10, 8))
     ax.imshow(background, extent=_extent(profile), origin="upper", cmap="terrain", alpha=0.9)
     if not forest.empty:
-        forest.plot(ax=ax, facecolor="#2c7a3f", edgecolor="#154822", alpha=0.45, linewidth=0.8)
+        forest.plot(ax=ax, facecolor="#4a9e5c", edgecolor="#1d5e2e", alpha=0.20, linewidth=1.4)
     if not water.empty:
-        water.plot(ax=ax, facecolor="#2a7fff", edgecolor="#0f4db8", alpha=0.6, linewidth=0.8)
+        water.plot(ax=ax, facecolor="#5ba8e8", edgecolor="#1a4a8f", alpha=0.25, linewidth=1.4)
     if not manual_no_build.empty:
-        manual_no_build.plot(ax=ax, facecolor="#f04b3a", edgecolor="#8a1b12", alpha=0.35, linewidth=0.8)
+        manual_no_build.plot(ax=ax, facecolor="none", edgecolor="#e03c2a", linewidth=2.0, linestyle="--")
     if not users.empty:
-        users.plot(ax=ax, color="#f8f32b", markersize=18, edgecolor="black", linewidth=0.4)
-    if candidate_transformer is not None and not candidate_transformer.empty:
-        candidate_transformer.plot(ax=ax, color="#ff4f9a", markersize=16, marker="s")
-    if candidate_poles is not None and not candidate_poles.empty:
-        candidate_poles.plot(ax=ax, color="#111111", markersize=8, marker=".")
+        users.plot(ax=ax, marker=".", markersize=10, facecolor="#000000", edgecolor="white", linewidth=0.5, alpha=0.90)
 
     legend_handles = [
-        Patch(facecolor="#2c7a3f", edgecolor="#154822", alpha=0.45, label="Forest"),
-        Patch(facecolor="#2a7fff", edgecolor="#0f4db8", alpha=0.6, label="Water"),
-        Patch(facecolor="#f04b3a", edgecolor="#8a1b12", alpha=0.35, label="Manual No-Build"),
+        Patch(facecolor="#4a9e5c", edgecolor="#1d5e2e", alpha=0.20, linewidth=1.4, label="Forest"),
+        Patch(facecolor="#5ba8e8", edgecolor="#1a4a8f", alpha=0.25, linewidth=1.4, label="Water"),
+        Patch(facecolor="none", edgecolor="#e03c2a", linewidth=2.0, linestyle="--", label="Manual No-Build"),
         Line2D(
             [0],
             [0],
-            marker="o",
+            marker=".",
             color="w",
-            markerfacecolor="#f8f32b",
-            markeredgecolor="black",
+            markerfacecolor="#000000",
+            markeredgecolor="white",
             markersize=7,
+            linewidth=0.5,
             label="Users",
         ),
     ]
-    if candidate_transformer is not None:
-        legend_handles.append(
-            Line2D(
-                [0],
-                [0],
-                marker="s",
-                color="w",
-                markerfacecolor="#ff4f9a",
-                markersize=7,
-                label="Transformer Candidates",
-            )
-        )
-    if candidate_poles is not None:
-        legend_handles.append(
-            Line2D(
-                [0],
-                [0],
-                marker=".",
-                color="#111111",
-                markersize=10,
-                label="Pole Candidates",
-            )
-        )
 
-    ax.legend(handles=legend_handles, loc="upper right")
+    ax.legend(handles=legend_handles, loc="upper right", fontsize=10, framealpha=0.9, edgecolor="gray")
     ax.set_title(title)
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")

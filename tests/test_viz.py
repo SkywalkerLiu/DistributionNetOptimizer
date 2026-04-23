@@ -63,16 +63,6 @@ def test_generate_terrain_3d_previews_writes_png_and_html() -> None:
         geometry=[Polygon([(50.0, 35.0), (70.0, 35.0), (70.0, 20.0), (50.0, 20.0)])],
         crs=crs,
     )
-    candidate_transformer = gpd.GeoDataFrame(
-        {"candidate_id": [1]},
-        geometry=[Point(20.0, 30.0)],
-        crs=crs,
-    )
-    candidate_poles = gpd.GeoDataFrame(
-        {"candidate_id": [1, 2]},
-        geometry=[Point(25.0, 25.0), Point(40.0, 30.0)],
-        crs=crs,
-    )
     planned_lines = gpd.GeoDataFrame(
         {"line_id": [1]},
         geometry=[LineString([(20.0, 30.0), (40.0, 30.0), (55.0, 50.0)])],
@@ -88,8 +78,6 @@ def test_generate_terrain_3d_previews_writes_png_and_html() -> None:
         forest=forest,
         water=water,
         manual_no_build=manual,
-        candidate_transformer=candidate_transformer,
-        candidate_poles=candidate_poles,
         planned_lines=planned_lines,
     )
 

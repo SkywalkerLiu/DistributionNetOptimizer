@@ -32,6 +32,8 @@ def generate_terrain(config: dict[str, Any]) -> np.ndarray:
             rng=rng,
             count=int(terrain_cfg.get("hill_count", 12)),
             valley_ratio=float(terrain_cfg.get("valley_ratio", 0.25)),
+            sigma_min=float(terrain_cfg.get("hill_sigma_min", 0.08)),
+            sigma_max=float(terrain_cfg.get("hill_sigma_max", 0.25)),
         )
 
     smooth_sigma = float(terrain_cfg.get("smooth_sigma", 0.0))
@@ -103,6 +105,8 @@ def _add_landforms(
     rng: np.random.Generator,
     count: int,
     valley_ratio: float,
+    sigma_min: float = 0.08,
+    sigma_max: float = 0.25,
 ) -> np.ndarray:
     """Add Gaussian hills and shallow valleys to the surface."""
 
@@ -114,8 +118,8 @@ def _add_landforms(
     for _ in range(count):
         center_x = rng.uniform(0.05, 0.95)
         center_y = rng.uniform(0.05, 0.95)
-        sigma_x = rng.uniform(0.04, 0.12)
-        sigma_y = rng.uniform(0.04, 0.12)
+        sigma_x = rng.uniform(sigma_min, sigma_max)
+        sigma_y = rng.uniform(sigma_min, sigma_max)
         amplitude = rng.uniform(20.0, 90.0)
         if rng.random() < valley_ratio:
             amplitude *= -0.8

@@ -1,35 +1,37 @@
 scene:
-  width_m: 5000
-  height_m: 5000
-  max_elevation_m: 500
+  width_m: 3000
+  height_m: 3000
+  max_elevation_m: 100
   resolution_m: 1
   origin_x_m: 0
-  origin_y_m: 5000
+  origin_y_m: 3000
   crs: EPSG:3857
   seed: 42
 
 terrain:
-  base_type: saddle
-  add_perlin_noise: true
+  base_type: ridge
+  add_perlin_noise: false
   noise_scale: 0.01
-  noise_amplitude: 25.0
+  noise_amplitude: 5.0
   noise_octaves: 4
   add_gaussian_hills: true
-  hill_count: 12
+  hill_count: 2
+  hill_sigma_min: 0.15
+  hill_sigma_max: 0.30
   valley_ratio: 0.25
-  smooth_sigma: 3.0
+  smooth_sigma: 15.0
   clip_min: 0
-  clip_max: 500
+  clip_max: 100
   max_buildable_slope_deg: 24.0
   max_buildable_roughness_m: 10.0
   roughness_window: 5
 
 users:
   count: 50
-  min_spacing_m: 100
+  min_spacing_m: 30
   distribution_mode: clustered
-  cluster_count: 4
-  cluster_radius_m: 300
+  cluster_count: 5
+  cluster_radius_m: 200
   load_kw_range: [2.0, 25.0]
   importance_range: [1, 3]
 

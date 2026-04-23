@@ -12,6 +12,18 @@ matplotlib.use("Agg")
 import numpy as np
 import plotly.graph_objects as go
 from matplotlib import pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+
+
+def _cyan_red_colormap() -> LinearSegmentedColormap:
+    colors = [
+        (0.0, "#00ffff"),
+        (0.25, "#00ff88"),
+        (0.5, "#ffff00"),
+        (0.75, "#ff8800"),
+        (1.0, "#ff0000"),
+    ]
+    return LinearSegmentedColormap.from_list("cyan_red", colors)
 
 
 @dataclass(slots=True)
@@ -62,8 +74,6 @@ def generate_terrain_3d_previews(
     forest: gpd.GeoDataFrame | None = None,
     water: gpd.GeoDataFrame | None = None,
     manual_no_build: gpd.GeoDataFrame | None = None,
-    candidate_transformer: gpd.GeoDataFrame | None = None,
-    candidate_poles: gpd.GeoDataFrame | None = None,
     planned_lines: gpd.GeoDataFrame | None = None,
 ) -> dict[str, Path]:
     """Generate static and interactive 3D terrain preview files."""
@@ -89,8 +99,6 @@ def generate_terrain_3d_previews(
         forest=forest,
         water=water,
         manual_no_build=manual_no_build,
-        candidate_transformer=candidate_transformer,
-        candidate_poles=candidate_poles,
         planned_lines=planned_lines,
     )
 
@@ -164,8 +172,6 @@ def build_scene_3d_overlays(
     forest: gpd.GeoDataFrame | None = None,
     water: gpd.GeoDataFrame | None = None,
     manual_no_build: gpd.GeoDataFrame | None = None,
-    candidate_transformer: gpd.GeoDataFrame | None = None,
-    candidate_poles: gpd.GeoDataFrame | None = None,
     planned_lines: gpd.GeoDataFrame | None = None,
 ) -> tuple[list[OverlayLine3D], list[OverlayPoint3D]]:
     """Build 3D overlay traces for points and boundaries on the terrain."""
@@ -183,7 +189,7 @@ def build_scene_3d_overlays(
             dtm=dtm,
             profile=profile,
             label="Forest",
-            color="#1f7a37",
+            color="#1d5e2e",
             width=3.0,
             z_offset=line_offset,
         )
@@ -194,7 +200,7 @@ def build_scene_3d_overlays(
             dtm=dtm,
             profile=profile,
             label="Water",
-            color="#2a7fff",
+            color="#1a4a8f",
             width=3.4,
             z_offset=line_offset * 1.15,
         )
@@ -205,7 +211,7 @@ def build_scene_3d_overlays(
             dtm=dtm,
             profile=profile,
             label="Manual No-Build",
-            color="#e1493a",
+            color="#e03c2a",
             width=3.6,
             z_offset=line_offset * 1.3,
         )
@@ -227,42 +233,14 @@ def build_scene_3d_overlays(
         dtm=dtm,
         profile=profile,
         label="Users",
-        color="#f8f32b",
-        size=7.0,
+        color="#000000",
+        size=3.0,
         z_offset=point_offset,
         text_column="user_id",
         text_prefix="user_id",
     )
     if user_points is not None:
         points.append(user_points)
-
-    transformer_points = _build_point_overlay(
-        gdf=candidate_transformer,
-        dtm=dtm,
-        profile=profile,
-        label="Transformer Candidates",
-        color="#ff4f9a",
-        size=7.5,
-        z_offset=point_offset * 1.15,
-        text_column="candidate_id",
-        text_prefix="candidate_id",
-    )
-    if transformer_points is not None:
-        points.append(transformer_points)
-
-    pole_points = _build_point_overlay(
-        gdf=candidate_poles,
-        dtm=dtm,
-        profile=profile,
-        label="Pole Candidates",
-        color="#111111",
-        size=4.5,
-        z_offset=point_offset * 1.05,
-        text_column="candidate_id",
-        text_prefix="candidate_id",
-    )
-    if pole_points is not None:
-        points.append(pole_points)
 
     return lines, points
 
@@ -281,14 +259,15 @@ def _save_matplotlib_surface(
 
     fig = plt.figure(figsize=(12, 9))
     ax = fig.add_subplot(111, projection="3d")
+    ax.computed_zorder = False
     plot = ax.plot_surface(
         surface.x,
         surface.y,
         surface.z,
-        cmap="terrain",
+        cmap=_cyan_red_colormap(),
         linewidth=0.0,
         antialiased=True,
-        alpha=0.94,
+        alpha=0.70,
     )
     colorbar = fig.colorbar(plot, ax=ax, shrink=0.7, pad=0.08)
     colorbar.set_label("Elevation (m)")
@@ -296,7 +275,15 @@ def _save_matplotlib_surface(
     seen_labels: set[str] = set()
     for line in lines:
         label = line.label if line.label not in seen_labels else "_nolegend_"
-        ax.plot(line.x, line.y, line.z, color=line.color, linewidth=line.width, label=label)
+        ax.plot(
+            line.x,
+            line.y,
+            line.z,
+            color=line.color,
+            linewidth=line.width,
+            label=label,
+            zorder=50,
+        )
         seen_labels.add(line.label)
 
     for point in points:
@@ -306,11 +293,13 @@ def _save_matplotlib_surface(
             point.y,
             point.z,
             color=point.color,
-            s=point.size**2,
+            s=(point.size * 2) ** 2,
+            marker="o",
             depthshade=False,
-            edgecolors="black" if point.color != "#111111" else point.color,
-            linewidths=0.35,
+            edgecolors="white",
+            linewidths=0.5,
             label=label,
+            zorder=100,
         )
         seen_labels.add(point.label)
 
@@ -364,7 +353,13 @@ def _save_plotly_surface(
                 x=surface.x,
                 y=surface.y,
                 z=surface.z,
-                colorscale="Earth",
+                colorscale=[
+                    [0.0, "#00ffff"],
+                    [0.25, "#00ff88"],
+                    [0.5, "#ffff00"],
+                    [0.75, "#ff8800"],
+                    [1.0, "#ff0000"],
+                ],
                 colorbar={"title": "Elevation (m)"},
                 hovertemplate="X=%{x:.1f} m<br>Y=%{y:.1f} m<br>Z=%{z:.2f} m<extra></extra>",
                 name="Terrain",
@@ -383,6 +378,7 @@ def _save_plotly_surface(
                 mode="lines",
                 name=line.label,
                 showlegend=line.label not in shown_labels,
+                legendgroup=line.label,
                 line={"color": line.color, "width": line.width},
                 hovertemplate=f"{line.label}<br>X=%{{x:.1f}} m<br>Y=%{{y:.1f}} m<br>Z=%{{z:.2f}} m<extra></extra>",
             )
@@ -398,10 +394,12 @@ def _save_plotly_surface(
                 mode="markers",
                 name=point.label,
                 showlegend=point.label not in shown_labels,
+                legendgroup=point.label,
                 marker={
                     "size": point.size,
                     "color": point.color,
-                    "line": {"color": "black", "width": 0.5},
+                    "symbol": "circle",
+                    "line": {"color": "white", "width": 0.5},
                 },
                 text=point.text,
                 hovertemplate=_point_hover_template(point.label, point.text),
