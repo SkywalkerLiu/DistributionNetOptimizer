@@ -53,6 +53,7 @@ def optimize_distribution_network(
     planning_cfg = config["planning"]
     crs = profile["crs"]
     users = _normalize_users(users=users, dtm=dtm, profile=profile)
+    blocked_mask = np.where((buildable_mask > 0) & (forbidden_mask == 0), 0, 1).astype(np.uint8)
 
     capacity_kva = float(planning_cfg.get("transformer_capacity_kva", 630.0))
     max_loading_ratio = float(planning_cfg.get("max_loading_ratio", 1.0))
@@ -84,6 +85,9 @@ def optimize_distribution_network(
         buildable_mask=buildable_mask,
         forbidden_mask=forbidden_mask,
         profile=profile,
+        source_node=source_node,
+        transformer_node=transformer_node,
+        users=users,
     )
 
     _attach_standard_terminals(
@@ -91,7 +95,7 @@ def optimize_distribution_network(
         source_node=source_node,
         transformer_node=transformer_node,
         users=users,
-        forbidden_mask=forbidden_mask,
+        blocked_mask=blocked_mask,
         profile=profile,
         config=config,
     )
@@ -103,10 +107,34 @@ def optimize_distribution_network(
         label="high-voltage source to transformer",
     )
     low_tree = _build_low_voltage_tree(
+        context=route_context,
         graph=route_context.graph,
         root=transformer_node["node_id"],
         users=users,
+        blocked_mask=blocked_mask,
+        profile=profile,
+        config=config,
         diagnostics=diagnostics,
+    )
+    hv_path = _expand_path_with_supports(
+        context=route_context,
+        path=hv_path,
+        line_type="hv_line",
+        dtm=dtm,
+        buildable_mask=buildable_mask,
+        forbidden_mask=forbidden_mask,
+        profile=profile,
+        config=config,
+    )
+    low_tree = _expand_tree_with_supports(
+        context=route_context,
+        tree=low_tree,
+        root=transformer_node["node_id"],
+        dtm=dtm,
+        buildable_mask=buildable_mask,
+        forbidden_mask=forbidden_mask,
+        profile=profile,
+        config=config,
     )
 
     phase_assignment = _optimize_phases(
@@ -193,16 +221,15 @@ def _attach_standard_terminals(
     source_node: dict[str, Any],
     transformer_node: dict[str, Any],
     users: gpd.GeoDataFrame,
-    forbidden_mask: np.ndarray,
+    blocked_mask: np.ndarray,
     profile: dict[str, Any],
     config: dict[str, Any],
 ) -> None:
-    """Attach source, transformer, and user terminals to the route graph."""
+    """Attach source/transformer to the route graph and register user terminals."""
 
     planning_cfg = config["planning"]
     sample_step = float(planning_cfg.get("forbidden_edge_sample_step_m", 5.0))
     max_span = float(planning_cfg.get("max_pole_span_m", 50.0))
-    max_service = float(planning_cfg.get("max_service_drop_m", 25.0))
     for node, kind, distance in (
         (source_node, "source", max_span),
         (transformer_node, "transformer", max_span),
@@ -215,22 +242,18 @@ def _attach_standard_terminals(
             z=node["z"],
             kind=kind,
             max_connect_m=distance,
-            forbidden_mask=forbidden_mask,
+            blocked_mask=blocked_mask,
             profile=profile,
             sample_step_m=sample_step,
         )
     for row in users.itertuples():
-        _add_terminal_node(
+        _register_terminal_node(
             context=context,
             node_id=f"user_{int(row.user_id)}",
             x=float(row.geometry.x),
             y=float(row.geometry.y),
             z=float(row.elev_m),
             kind="user",
-            max_connect_m=max_service,
-            forbidden_mask=forbidden_mask,
-            profile=profile,
-            sample_step_m=sample_step,
         )
 
 
@@ -309,6 +332,38 @@ def _select_transformer(
     roughness_score = roughness[rows, cols] / max(float(np.percentile(roughness, 95)), 1.0)
     score = weighted_distance + 0.35 * hv_distance + 25.0 * slope_score + 15.0 * roughness_score
     best = int(np.argmin(score))
+    best_row = int(rows[best])
+    best_col = int(cols[best])
+    refine_radius = max(1, stride)
+    row_min = max(0, best_row - refine_radius)
+    row_max = min(passable.shape[0] - 1, best_row + refine_radius)
+    col_min = max(0, best_col - refine_radius)
+    col_max = min(passable.shape[1] - 1, best_col + refine_radius)
+    refine_rows, refine_cols = np.where(passable[row_min : row_max + 1, col_min : col_max + 1])
+    if len(refine_rows) > 0:
+        refine_rows = refine_rows + row_min
+        refine_cols = refine_cols + col_min
+        refine_xs, refine_ys = _cells_to_xy(profile, refine_rows, refine_cols)
+        refine_dist_to_users = np.sqrt(
+            (refine_xs[:, None] - user_x[None, :]) ** 2 + (refine_ys[:, None] - user_y[None, :]) ** 2
+        )
+        refine_weighted_distance = (refine_dist_to_users * weights[None, :]).sum(axis=1) / max(float(weights.sum()), 1.0)
+        refine_hv_distance = np.hypot(refine_xs - source_x, refine_ys - source_y)
+        refine_slope_score = slope[refine_rows, refine_cols] / max(float(np.percentile(slope, 95)), 1.0)
+        refine_roughness_score = roughness[refine_rows, refine_cols] / max(float(np.percentile(roughness, 95)), 1.0)
+        refine_score = (
+            refine_weighted_distance
+            + 0.35 * refine_hv_distance
+            + 25.0 * refine_slope_score
+            + 15.0 * refine_roughness_score
+        )
+        refine_best = int(np.argmin(refine_score))
+        rows = refine_rows
+        cols = refine_cols
+        xs = refine_xs
+        ys = refine_ys
+        score = refine_score
+        best = refine_best
     return {
         "node_id": "TX1",
         "x": float(xs[best]),
@@ -359,8 +414,11 @@ def _build_routing_graph(
     buildable_mask: np.ndarray,
     forbidden_mask: np.ndarray,
     profile: dict[str, Any],
+    source_node: dict[str, Any] | None = None,
+    transformer_node: dict[str, Any] | None = None,
+    users: gpd.GeoDataFrame | None = None,
 ) -> _RoutingContext:
-    """Build a coarse route graph that dynamic terminals attach to."""
+    """Build a sparse visibility graph over the continuous feasible domain."""
 
     planning_cfg = config["planning"]
     resolution = abs(float(profile["transform"].a))
@@ -373,49 +431,49 @@ def _build_routing_graph(
     grid_y: list[float] = []
 
     passable = (buildable_mask > 0) & (forbidden_mask == 0)
-    row_values = list(range(0, dtm.shape[0], stride))
-    col_values = list(range(0, dtm.shape[1], stride))
-    for row in row_values:
-        for col in col_values:
-            if not bool(passable[row, col]):
-                continue
-            node_id = _grid_node_id(row, col)
-            x, y = _cell_to_xy(profile, row, col)
-            data = {"node_id": node_id, "kind": "grid", "x": x, "y": y, "z": float(dtm[row, col]), "row": row, "col": col}
-            node_data[node_id] = data
-            graph.add_node(node_id)
-            grid_node_ids.append(node_id)
-            grid_x.append(x)
-            grid_y.append(y)
+    anchor_cells = _collect_route_anchor_cells(
+        passable=passable,
+        profile=profile,
+        stride=stride,
+        source_node=source_node,
+        transformer_node=transformer_node,
+        users=users,
+        config=config,
+    )
+    if not anchor_cells:
+        raise ValueError("No feasible continuous-domain route anchors are available.")
 
-    for row in row_values:
-        for col in col_values:
-            node_id = _grid_node_id(row, col)
-            if node_id not in node_data:
-                continue
-            for next_row, next_col in ((row + stride, col), (row, col + stride)):
-                next_id = _grid_node_id(next_row, next_col)
-                if next_id not in node_data:
-                    continue
-                if _line_crosses_forbidden(
-                    node_data[node_id]["x"],
-                    node_data[node_id]["y"],
-                    node_data[next_id]["x"],
-                    node_data[next_id]["y"],
-                    forbidden_mask=forbidden_mask,
-                    profile=profile,
-                    sample_step_m=float(planning_cfg.get("forbidden_edge_sample_step_m", 5.0)),
-                ):
-                    continue
-                metrics = _edge_metrics(
-                    a=node_data[node_id],
-                    b=node_data[next_id],
-                    slope=slope,
-                    roughness=roughness,
-                    profile=profile,
-                    planning_cfg=planning_cfg,
-                )
-                graph.add_edge(node_id, next_id, **metrics)
+    for row, col in sorted(anchor_cells):
+        node_id = _grid_node_id(row, col)
+        x, y = _cell_to_xy(profile, row, col)
+        data = {
+            "node_id": node_id,
+            "kind": "grid",
+            "x": x,
+            "y": y,
+            "z": float(dtm[row, col]),
+            "row": row,
+            "col": col,
+        }
+        node_data[node_id] = data
+        graph.add_node(node_id)
+        grid_node_ids.append(node_id)
+        grid_x.append(x)
+        grid_y.append(y)
+
+    _add_visibility_edges(
+        graph=graph,
+        node_data=node_data,
+        node_ids=grid_node_ids,
+        node_x=np.asarray(grid_x, dtype=np.float64),
+        node_y=np.asarray(grid_y, dtype=np.float64),
+        slope=slope,
+        roughness=roughness,
+        blocked_mask=np.where(passable, 0, 1).astype(np.uint8),
+        profile=profile,
+        planning_cfg=planning_cfg,
+        step_m=step_m,
+    )
 
     return _RoutingContext(
         graph=graph,
@@ -424,6 +482,217 @@ def _build_routing_graph(
         grid_x=np.asarray(grid_x, dtype=np.float64),
         grid_y=np.asarray(grid_y, dtype=np.float64),
     )
+
+
+def _collect_route_anchor_cells(
+    *,
+    passable: np.ndarray,
+    profile: dict[str, Any],
+    stride: int,
+    source_node: dict[str, Any] | None,
+    transformer_node: dict[str, Any] | None,
+    users: gpd.GeoDataFrame | None,
+    config: dict[str, Any],
+) -> set[tuple[int, int]]:
+    """Collect sparse anchor cells for continuous-domain visibility routing."""
+
+    anchor_cells: set[tuple[int, int]] = set()
+    row_values = list(range(0, passable.shape[0], stride))
+    for row_index, row in enumerate(row_values):
+        col_offset = stride // 2 if row_index % 2 else 0
+        for col in range(col_offset, passable.shape[1], stride):
+            nearest = _nearest_passable_cell(
+                passable=passable,
+                row=row,
+                col=col,
+                search_radius=max(1, stride // 2),
+            )
+            if nearest is not None:
+                anchor_cells.add(nearest)
+
+    boundary_stride = max(1, stride // 2)
+    boundary_mask = _route_boundary_mask(passable)
+    boundary_rows, boundary_cols = np.where(boundary_mask)
+    for row, col in zip(boundary_rows.tolist(), boundary_cols.tolist()):
+        if row % boundary_stride == 0 or col % boundary_stride == 0:
+            anchor_cells.add((int(row), int(col)))
+
+    point_specs: list[tuple[float, float, int]] = []
+    local_radius = max(1, stride)
+    if source_node is not None:
+        point_specs.append((float(source_node["x"]), float(source_node["y"]), local_radius))
+    if transformer_node is not None:
+        point_specs.append((float(transformer_node["x"]), float(transformer_node["y"]), local_radius))
+    if users is not None and not users.empty:
+        user_radius_m = min(
+            float(config["planning"].get("max_service_drop_m", 25.0)),
+            float(config["planning"].get("path_search_step_m", 20.0)) * 1.5,
+        )
+        user_radius = max(1, int(round(user_radius_m / abs(float(profile["transform"].a)))))
+        for row in users.itertuples():
+            point_specs.append((float(row.geometry.x), float(row.geometry.y), user_radius))
+
+    for x, y, radius_cells in point_specs:
+        _add_local_route_seed_cells(
+            anchor_cells=anchor_cells,
+            passable=passable,
+            profile=profile,
+            x=x,
+            y=y,
+            radius_cells=radius_cells,
+        )
+
+    return anchor_cells
+
+
+def _route_boundary_mask(passable: np.ndarray) -> np.ndarray:
+    """Return passable cells that border any blocked cell in the 8-neighborhood."""
+
+    padded = np.pad(passable.astype(bool), 1, mode="constant", constant_values=False)
+    boundary = np.zeros_like(passable, dtype=bool)
+    height, width = passable.shape
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            neighbor = padded[1 + dr : 1 + dr + height, 1 + dc : 1 + dc + width]
+            boundary |= passable & ~neighbor
+    return boundary
+
+
+def _add_local_route_seed_cells(
+    *,
+    anchor_cells: set[tuple[int, int]],
+    passable: np.ndarray,
+    profile: dict[str, Any],
+    x: float,
+    y: float,
+    radius_cells: int,
+) -> None:
+    """Seed route anchors near source, transformer, and users."""
+
+    row, col = _xy_to_cell(profile, x, y, shape=passable.shape)
+    search_radius = max(1, radius_cells // 2)
+    radii = sorted({0, max(1, radius_cells // 2), radius_cells})
+    for radius in radii:
+        offsets = [
+            (0, 0),
+            (radius, 0),
+            (-radius, 0),
+            (0, radius),
+            (0, -radius),
+            (radius, radius),
+            (radius, -radius),
+            (-radius, radius),
+            (-radius, -radius),
+        ]
+        for dr, dc in offsets:
+            nearest = _nearest_passable_cell(
+                passable=passable,
+                row=int(np.clip(row + dr, 0, passable.shape[0] - 1)),
+                col=int(np.clip(col + dc, 0, passable.shape[1] - 1)),
+                search_radius=search_radius,
+            )
+            if nearest is not None:
+                anchor_cells.add(nearest)
+
+
+def _nearest_passable_cell(
+    *,
+    passable: np.ndarray,
+    row: int,
+    col: int,
+    search_radius: int,
+) -> tuple[int, int] | None:
+    """Find the nearest passable raster cell near a target row/column."""
+
+    row = int(np.clip(row, 0, passable.shape[0] - 1))
+    col = int(np.clip(col, 0, passable.shape[1] - 1))
+    if bool(passable[row, col]):
+        return row, col
+    best: tuple[int, int] | None = None
+    best_distance = float("inf")
+    for radius in range(1, max(1, search_radius) + 1):
+        row_min = max(0, row - radius)
+        row_max = min(passable.shape[0] - 1, row + radius)
+        col_min = max(0, col - radius)
+        col_max = min(passable.shape[1] - 1, col + radius)
+        for rr in range(row_min, row_max + 1):
+            for cc in range(col_min, col_max + 1):
+                if not bool(passable[rr, cc]):
+                    continue
+                distance = math.hypot(rr - row, cc - col)
+                if distance < best_distance:
+                    best_distance = distance
+                    best = (rr, cc)
+        if best is not None:
+            return best
+    return None
+
+
+def _add_visibility_edges(
+    *,
+    graph: nx.Graph,
+    node_data: dict[str, dict[str, Any]],
+    node_ids: list[str],
+    node_x: np.ndarray,
+    node_y: np.ndarray,
+    slope: np.ndarray,
+    roughness: np.ndarray,
+    blocked_mask: np.ndarray,
+    profile: dict[str, Any],
+    planning_cfg: dict[str, Any],
+    step_m: float,
+) -> None:
+    """Connect sparse anchors with line-of-sight edges in the feasible domain."""
+
+    if len(node_ids) <= 1:
+        return
+    max_neighbors = int(planning_cfg.get("visibility_neighbor_count", 14))
+    visibility_radius = float(
+        planning_cfg.get(
+            "visibility_radius_m",
+            max(step_m * 6.0, float(planning_cfg.get("max_pole_span_m", 50.0)) * 3.0),
+        )
+    )
+    sample_step = float(planning_cfg.get("forbidden_edge_sample_step_m", 5.0))
+    radius_sq = visibility_radius * visibility_radius
+
+    for index, node_id in enumerate(node_ids):
+        dx = node_x - node_x[index]
+        dy = node_y - node_y[index]
+        dist_sq = dx * dx + dy * dy
+        nearby = np.where((dist_sq > 1e-9) & (dist_sq <= radius_sq))[0]
+        if len(nearby) < max_neighbors:
+            nearby = np.where(dist_sq > 1e-9)[0]
+        if len(nearby) == 0:
+            continue
+        ordered = nearby[np.argsort(dist_sq[nearby])[:max_neighbors]]
+        for neighbor_index in ordered:
+            if int(neighbor_index) <= index:
+                continue
+            target_id = node_ids[int(neighbor_index)]
+            if graph.has_edge(node_id, target_id):
+                continue
+            if _line_crosses_blocked(
+                float(node_x[index]),
+                float(node_y[index]),
+                float(node_x[int(neighbor_index)]),
+                float(node_y[int(neighbor_index)]),
+                blocked_mask=blocked_mask,
+                profile=profile,
+                sample_step_m=sample_step,
+            ):
+                continue
+            metrics = _edge_metrics(
+                a=node_data[node_id],
+                b=node_data[target_id],
+                slope=slope,
+                roughness=roughness,
+                profile=profile,
+                planning_cfg=planning_cfg,
+            )
+            graph.add_edge(node_id, target_id, **metrics)
 
 
 def _add_terminal_node(
@@ -435,7 +704,7 @@ def _add_terminal_node(
     z: float,
     kind: str,
     max_connect_m: float,
-    forbidden_mask: np.ndarray,
+    blocked_mask: np.ndarray,
     profile: dict[str, Any],
     sample_step_m: float,
 ) -> None:
@@ -468,12 +737,12 @@ def _add_terminal_node(
     for index in nearby[np.argsort(distances[nearby])[:max_edges]]:
         target_id = context.grid_node_ids[int(index)]
         target = context.node_data[target_id]
-        if _line_crosses_forbidden(
+        if _line_crosses_blocked(
             x,
             y,
             target["x"],
             target["y"],
-            forbidden_mask=forbidden_mask,
+            blocked_mask=blocked_mask,
             profile=profile,
             sample_step_m=sample_step_m,
         ):
@@ -486,6 +755,29 @@ def _add_terminal_node(
 
     if not connected:
         raise ValueError(f"Terminal {node_id} cannot connect without crossing a hard constraint.")
+
+
+def _register_terminal_node(
+    *,
+    context: _RoutingContext,
+    node_id: str,
+    x: float,
+    y: float,
+    z: float,
+    kind: str,
+) -> None:
+    """Register a terminal node without connecting it into the route graph."""
+
+    context.graph.add_node(node_id)
+    context.node_data[node_id] = {
+        "node_id": node_id,
+        "kind": kind,
+        "x": float(x),
+        "y": float(y),
+        "z": float(z),
+        "row": None,
+        "col": None,
+    }
 
 
 def _shortest_path_or_diagnostic(
@@ -507,35 +799,381 @@ def _shortest_path_or_diagnostic(
 
 def _build_low_voltage_tree(
     *,
+    context: _RoutingContext,
     graph: nx.Graph,
     root: str,
     users: gpd.GeoDataFrame,
+    blocked_mask: np.ndarray,
+    profile: dict[str, Any],
+    config: dict[str, Any],
     diagnostics: list[str],
 ) -> nx.Graph:
-    """Merge user paths and reduce them to a radial low-voltage tree."""
+    """Build a shared LV backbone and attach users as service-drop leaves only."""
 
-    used = nx.Graph()
-    for row in users.itertuples():
-        user_node = f"user_{int(row.user_id)}"
-        path = _shortest_path_or_diagnostic(
-            graph=graph,
-            source=root,
-            target=user_node,
-            diagnostics=diagnostics,
-            label=f"low-voltage route to user {int(row.user_id)}",
+    planning_cfg = config["planning"]
+    service_cost_per_m = float(planning_cfg.get("service_line_cost_per_m", 35.0))
+    lv_graph = graph.copy()
+    if "SOURCE" in lv_graph:
+        lv_graph.remove_node("SOURCE")
+    attachment_candidates = _user_attachment_candidates(
+        context=context,
+        root=root,
+        users=users,
+        blocked_mask=blocked_mask,
+        profile=profile,
+        config=config,
+        diagnostics=diagnostics,
+    )
+    if not attachment_candidates:
+        raise ValueError("Unable to find any feasible low-voltage attachment candidates.")
+
+    root_lengths = nx.single_source_dijkstra_path_length(lv_graph, root, weight="cost")
+    ordered_users = sorted(
+        users.itertuples(),
+        key=lambda row: (
+            -_best_root_attachment_cost(
+                candidates=attachment_candidates.get(int(row.user_id), []),
+                root_lengths=root_lengths,
+            ),
+            -float(row.apparent_kva),
+        ),
+    )
+
+    tree = nx.Graph()
+    tree.add_node(root)
+    backbone_nodes = {root}
+
+    for row in ordered_users:
+        user_id = int(row.user_id)
+        user_node = f"user_{user_id}"
+        candidates = attachment_candidates.get(user_id, [])
+        if not candidates:
+            diagnostics.append(f"User {user_id} has no feasible service attachment candidate.")
+            continue
+
+        best = _select_best_attachment_to_backbone(
+            graph=lv_graph,
+            backbone_nodes=backbone_nodes,
+            candidates=candidates,
+            service_cost_per_m=service_cost_per_m,
         )
-        for node in path:
-            used.add_node(node)
-        for from_node, to_node in zip(path[:-1], path[1:]):
-            used.add_edge(from_node, to_node, **graph.edges[from_node, to_node])
+        if best is None:
+            diagnostics.append(f"User {user_id} cannot reach the shared low-voltage backbone.")
+            continue
 
-    if used.number_of_edges() == 0:
-        raise ValueError("Unable to build any low-voltage route.")
-    for component in list(nx.connected_components(used)):
-        if root not in component:
-            diagnostics.append(f"Discarded disconnected low-voltage component of size {len(component)}.")
-            used.remove_nodes_from(component)
-    return nx.minimum_spanning_tree(used, weight="cost")
+        trimmed_path = _trim_path_to_new_backbone_segment(best["path"], backbone_nodes)
+        for node_id in trimmed_path:
+            tree.add_node(node_id)
+        for from_node, to_node in zip(trimmed_path[:-1], trimmed_path[1:]):
+            if not tree.has_edge(from_node, to_node):
+                tree.add_edge(from_node, to_node, **graph.edges[from_node, to_node])
+        backbone_nodes.update(trimmed_path)
+
+        access_node = str(best["access_node"])
+        service_metrics = _metrics_between_points(context.node_data[access_node], context.node_data[user_node])
+        service_metrics["cost"] = service_metrics["length_3d_m"] * service_cost_per_m
+        tree.add_node(user_node)
+        tree.add_edge(access_node, user_node, **service_metrics)
+
+    if tree.number_of_edges() == 0:
+        raise ValueError("Unable to build any shared low-voltage route.")
+    return tree
+
+
+def _expand_path_with_supports(
+    *,
+    context: _RoutingContext,
+    path: list[str],
+    line_type: str,
+    dtm: np.ndarray,
+    buildable_mask: np.ndarray,
+    forbidden_mask: np.ndarray,
+    profile: dict[str, Any],
+    config: dict[str, Any],
+) -> list[str]:
+    """Insert intermediate support nodes so routed segments respect span limits."""
+
+    if len(path) <= 1:
+        return path
+    expanded: list[str] = [path[0]]
+    for from_node, to_node in zip(path[:-1], path[1:]):
+        chain = _edge_support_chain(
+            context=context,
+            from_node=from_node,
+            to_node=to_node,
+            line_type=line_type,
+            dtm=dtm,
+            buildable_mask=buildable_mask,
+            forbidden_mask=forbidden_mask,
+            profile=profile,
+            config=config,
+        )
+        expanded.extend(chain[1:])
+    return expanded
+
+
+def _expand_tree_with_supports(
+    *,
+    context: _RoutingContext,
+    tree: nx.Graph,
+    root: str,
+    dtm: np.ndarray,
+    buildable_mask: np.ndarray,
+    forbidden_mask: np.ndarray,
+    profile: dict[str, Any],
+    config: dict[str, Any],
+) -> nx.Graph:
+    """Expand every backbone edge with intermediate support nodes when needed."""
+
+    if tree.number_of_edges() == 0:
+        return tree
+    expanded = nx.Graph()
+    expanded.add_node(root)
+    for parent, child in nx.bfs_edges(tree, root):
+        line_type = "service_drop" if child.startswith("user_") or parent.startswith("user_") else "lv_line"
+        chain = _edge_support_chain(
+            context=context,
+            from_node=parent,
+            to_node=child,
+            line_type=line_type,
+            dtm=dtm,
+            buildable_mask=buildable_mask,
+            forbidden_mask=forbidden_mask,
+            profile=profile,
+            config=config,
+        )
+        for node_id in chain:
+            expanded.add_node(node_id)
+        load_metrics = tree.edges[parent, child]
+        for from_node, to_node in zip(chain[:-1], chain[1:]):
+            metrics = _metrics_between_points(context.node_data[from_node], context.node_data[to_node])
+            metrics["cost"] = metrics["length_3d_m"] * float(
+                config["planning"].get(
+                    "service_line_cost_per_m" if line_type == "service_drop" else "line_cost_per_m",
+                    35.0 if line_type == "service_drop" else 55.0,
+                )
+            )
+            for key in ("load_a_kva", "load_b_kva", "load_c_kva"):
+                if key in load_metrics:
+                    metrics[key] = load_metrics[key]
+            expanded.add_edge(from_node, to_node, **metrics)
+    return expanded
+
+
+def _edge_support_chain(
+    *,
+    context: _RoutingContext,
+    from_node: str,
+    to_node: str,
+    line_type: str,
+    dtm: np.ndarray,
+    buildable_mask: np.ndarray,
+    forbidden_mask: np.ndarray,
+    profile: dict[str, Any],
+    config: dict[str, Any],
+) -> list[str]:
+    """Return one edge split by intermediate supports when span limits require it."""
+
+    if from_node.startswith("user_") or to_node.startswith("user_"):
+        span_limit = float(config["planning"].get("max_service_drop_m", 25.0))
+    else:
+        span_limit = float(config["planning"].get("max_pole_span_m", 50.0))
+    start = context.node_data[from_node]
+    end = context.node_data[to_node]
+    metrics = _metrics_between_points(start, end)
+    if metrics["horizontal_length_m"] <= span_limit + 1e-9:
+        return [from_node, to_node]
+
+    segment_count = max(2, int(math.ceil(metrics["horizontal_length_m"] / max(span_limit, 1.0))))
+    chain = [from_node]
+    for index in range(1, segment_count):
+        fraction = float(index) / float(segment_count)
+        x = float(start["x"]) + (float(end["x"]) - float(start["x"])) * fraction
+        y = float(start["y"]) + (float(end["y"]) - float(start["y"])) * fraction
+        support_id = _create_inline_support_node(
+            context=context,
+            x=x,
+            y=y,
+            line_type=line_type,
+            dtm=dtm,
+            buildable_mask=buildable_mask,
+            forbidden_mask=forbidden_mask,
+            profile=profile,
+            config=config,
+        )
+        chain.append(support_id)
+    chain.append(to_node)
+    return chain
+
+
+def _create_inline_support_node(
+    *,
+    context: _RoutingContext,
+    x: float,
+    y: float,
+    line_type: str,
+    dtm: np.ndarray,
+    buildable_mask: np.ndarray,
+    forbidden_mask: np.ndarray,
+    profile: dict[str, Any],
+    config: dict[str, Any],
+) -> str:
+    """Create one inline support snapped onto feasible terrain near a routed segment."""
+
+    resolution = abs(float(profile["transform"].a))
+    row, col = _xy_to_cell(profile, x, y, shape=buildable_mask.shape)
+    nearest = _nearest_passable_cell(
+        passable=(buildable_mask > 0) & (forbidden_mask == 0),
+        row=row,
+        col=col,
+        search_radius=max(1, int(math.ceil(float(config["planning"].get("path_search_step_m", 20.0)) / resolution))),
+    )
+    if nearest is not None:
+        row, col = nearest
+        x, y = _cell_to_xy(profile, row, col)
+    node_id = f"seg_{len(context.node_data) + 1:06d}"
+    context.node_data[node_id] = {
+        "node_id": node_id,
+        "kind": "grid",
+        "x": float(x),
+        "y": float(y),
+        "z": float(_sample_array(dtm, profile, float(x), float(y))),
+        "row": int(row),
+        "col": int(col),
+        "line_hint": line_type,
+    }
+    context.graph.add_node(node_id)
+    return node_id
+
+
+def _user_attachment_candidates(
+    *,
+    context: _RoutingContext,
+    root: str,
+    users: gpd.GeoDataFrame,
+    blocked_mask: np.ndarray,
+    profile: dict[str, Any],
+    config: dict[str, Any],
+    diagnostics: list[str],
+) -> dict[int, list[dict[str, Any]]]:
+    """Enumerate feasible service-drop attachment nodes for each user."""
+
+    planning_cfg = config["planning"]
+    max_service = float(planning_cfg.get("max_service_drop_m", 25.0))
+    sample_step = float(planning_cfg.get("forbidden_edge_sample_step_m", 5.0))
+    candidates_by_user: dict[int, list[dict[str, Any]]] = {}
+    root_data = context.node_data[root]
+
+    for row in users.itertuples():
+        user_id = int(row.user_id)
+        x = float(row.geometry.x)
+        y = float(row.geometry.y)
+        distances = np.hypot(context.grid_x - x, context.grid_y - y)
+        nearby = np.where(distances <= max_service + 1e-9)[0]
+        candidates: list[dict[str, Any]] = []
+        for index in nearby[np.argsort(distances[nearby])]:
+            node_id = context.grid_node_ids[int(index)]
+            node = context.node_data[node_id]
+            if _line_crosses_blocked(
+                x,
+                y,
+                float(node["x"]),
+                float(node["y"]),
+                blocked_mask=blocked_mask,
+                profile=profile,
+                sample_step_m=sample_step,
+            ):
+                continue
+            candidates.append(
+                {
+                    "access_node": node_id,
+                    "service_length_m": float(distances[int(index)]),
+                }
+            )
+
+        root_distance = math.hypot(x - float(root_data["x"]), y - float(root_data["y"]))
+        if root_distance <= max_service + 1e-9 and not _line_crosses_blocked(
+            x,
+            y,
+            float(root_data["x"]),
+            float(root_data["y"]),
+            blocked_mask=blocked_mask,
+            profile=profile,
+            sample_step_m=sample_step,
+        ):
+            candidates.append({"access_node": root, "service_length_m": float(root_distance)})
+
+        if not candidates:
+            diagnostics.append(
+                f"User {user_id} has no feasible pole/transformer attachment within {max_service:.1f} m."
+            )
+        candidates_by_user[user_id] = candidates
+    return candidates_by_user
+
+
+def _best_root_attachment_cost(
+    *,
+    candidates: list[dict[str, Any]],
+    root_lengths: dict[str, float],
+) -> float:
+    """Return the cheapest root-to-candidate path cost for ordering users."""
+
+    if not candidates:
+        return -1.0
+    best = float("inf")
+    for candidate in candidates:
+        access_node = str(candidate["access_node"])
+        if access_node in root_lengths:
+            best = min(best, float(root_lengths[access_node]))
+    return best if math.isfinite(best) else -1.0
+
+
+def _select_best_attachment_to_backbone(
+    *,
+    graph: nx.Graph,
+    backbone_nodes: set[str],
+    candidates: list[dict[str, Any]],
+    service_cost_per_m: float,
+) -> dict[str, Any] | None:
+    """Choose the access node that adds the least new backbone plus service cost."""
+
+    if not candidates:
+        return None
+    lengths, paths = nx.multi_source_dijkstra(graph, list(backbone_nodes), weight="cost")
+    best: dict[str, Any] | None = None
+    best_score = float("inf")
+    for candidate in candidates:
+        access_node = str(candidate["access_node"])
+        if access_node not in paths:
+            continue
+        path = list(paths[access_node])
+        trimmed = _trim_path_to_new_backbone_segment(path, backbone_nodes)
+        incremental_cost = 0.0
+        for from_node, to_node in zip(trimmed[:-1], trimmed[1:]):
+            incremental_cost += float(graph.edges[from_node, to_node].get("cost", 0.0))
+        score = incremental_cost + float(candidate["service_length_m"]) * service_cost_per_m
+        if score + 1e-9 < best_score:
+            best_score = score
+            best = {
+                **candidate,
+                "path": path,
+                "trimmed_path": trimmed,
+                "incremental_cost": incremental_cost,
+                "score": score,
+            }
+    return best
+
+
+def _trim_path_to_new_backbone_segment(path: list[str], backbone_nodes: set[str]) -> list[str]:
+    """Trim a graph path so only the new segment beyond the shared backbone remains."""
+
+    if not path:
+        return []
+    last_backbone_index = 0
+    for index, node_id in enumerate(path):
+        if node_id in backbone_nodes:
+            last_backbone_index = index
+    return path[last_backbone_index:]
 
 
 def _optimize_phases(
@@ -592,16 +1230,14 @@ def _phase_score(
     assignment: dict[int, str],
     user_kva: dict[int, float],
 ) -> float:
-    """Score total and branch phase balance for a phase assignment."""
+    """Score transformer and shared-LV-line phase balance for a phase assignment."""
 
     downstream = _downstream_loads(tree=tree, root=root, assignment=assignment, user_kva=user_kva)
     root_load = downstream["node_loads"].get(root, np.zeros(3, dtype=np.float64))
-    branch_scores = [
-        _unbalance_ratio(load)
-        for load in downstream["edge_loads"].values()
-        if float(load.sum()) > 0.0
-    ]
-    return _unbalance_ratio(root_load) + 0.35 * (float(np.mean(branch_scores)) if branch_scores else 0.0)
+    line_scores = _shared_lv_line_unbalance_scores(downstream["edge_loads"])
+    mean_line_score = float(np.mean(line_scores)) if line_scores else 0.0
+    max_line_score = float(np.max(line_scores)) if line_scores else 0.0
+    return _unbalance_ratio(root_load) + 0.55 * mean_line_score + 0.90 * max_line_score
 
 
 def _compute_electrical_metrics(
@@ -1409,9 +2045,9 @@ def _build_summary(
     planning_cfg = config["planning"]
     total_phase_load = electrical["node_loads"].get("TX1", np.zeros(3, dtype=np.float64))
     max_voltage_drop = float(users["voltage_drop_pct"].max()) if len(users) else 0.0
-    max_line_unbalance = 0.0
-    for load in electrical["edge_loads"].values():
-        max_line_unbalance = max(max_line_unbalance, _unbalance_ratio(load))
+    shared_lv_line_scores = _shared_lv_line_unbalance_scores(electrical["edge_loads"])
+    max_line_unbalance = float(np.max(shared_lv_line_scores)) if shared_lv_line_scores else 0.0
+    mean_line_unbalance = float(np.mean(shared_lv_line_scores)) if shared_lv_line_scores else 0.0
 
     total_cost = float(planned_lines["cost"].sum() if not planned_lines.empty else 0.0)
     total_cost += float(planning_cfg.get("transformer_fixed_cost", 120000.0))
@@ -1422,6 +2058,8 @@ def _build_summary(
         diagnostics.append(f"Maximum voltage drop {max_voltage_drop:.2f}% exceeds configured limit.")
     if _unbalance_ratio(total_phase_load) > float(planning_cfg.get("phase_balance_max_ratio", 0.15)):
         diagnostics.append("Transformer phase balance exceeds configured hard threshold.")
+    if max_line_unbalance > float(planning_cfg.get("phase_balance_max_ratio", 0.15)):
+        diagnostics.append("Shared LV line phase balance exceeds configured hard threshold.")
     return {
         "feasible": len(diagnostics) == 0 and violation_count == 0 and total_kva <= capacity_limit_kva,
         "diagnostics": diagnostics,
@@ -1448,7 +2086,8 @@ def _build_summary(
             "load_b_kva": round(float(total_phase_load[1]), 3),
             "load_c_kva": round(float(total_phase_load[2]), 3),
             "transformer_unbalance_ratio": round(_unbalance_ratio(total_phase_load), 5),
-            "max_line_unbalance_ratio": round(max_line_unbalance, 5),
+            "max_shared_lv_line_unbalance_ratio": round(max_line_unbalance, 5),
+            "mean_shared_lv_line_unbalance_ratio": round(mean_line_unbalance, 5),
         },
         "voltage": {"max_voltage_drop_pct": round(max_voltage_drop, 4)},
     }
@@ -1497,6 +2136,29 @@ def _metrics_between_points(a: dict[str, Any], b: dict[str, Any]) -> dict[str, f
     }
 
 
+def _line_crosses_blocked(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    *,
+    blocked_mask: np.ndarray,
+    profile: dict[str, Any],
+    sample_step_m: float,
+) -> bool:
+    """Return true when a segment samples any blocked raster cell."""
+
+    distance = math.hypot(x2 - x1, y2 - y1)
+    sample_count = max(2, int(math.ceil(distance / max(sample_step_m, 0.5))) + 1)
+    for fraction in np.linspace(0.0, 1.0, sample_count):
+        x = x1 + (x2 - x1) * float(fraction)
+        y = y1 + (y2 - y1) * float(fraction)
+        row, col = _xy_to_cell(profile, x, y, shape=blocked_mask.shape)
+        if blocked_mask[row, col] > 0:
+            return True
+    return False
+
+
 def _line_crosses_forbidden(
     x1: float,
     y1: float,
@@ -1507,17 +2169,17 @@ def _line_crosses_forbidden(
     profile: dict[str, Any],
     sample_step_m: float,
 ) -> bool:
-    """Return true when a segment samples any forbidden raster cell."""
+    """Backward-compatible helper for checks against hard-forbidden areas only."""
 
-    distance = math.hypot(x2 - x1, y2 - y1)
-    sample_count = max(2, int(math.ceil(distance / max(sample_step_m, 0.5))) + 1)
-    for fraction in np.linspace(0.0, 1.0, sample_count):
-        x = x1 + (x2 - x1) * float(fraction)
-        y = y1 + (y2 - y1) * float(fraction)
-        row, col = _xy_to_cell(profile, x, y, shape=forbidden_mask.shape)
-        if forbidden_mask[row, col] > 0:
-            return True
-    return False
+    return _line_crosses_blocked(
+        x1,
+        y1,
+        x2,
+        y2,
+        blocked_mask=forbidden_mask,
+        profile=profile,
+        sample_step_m=sample_step_m,
+    )
 
 
 def _grid_node_id(row: int, col: int) -> str:
@@ -1608,3 +2270,20 @@ def _unbalance_ratio(load: np.ndarray) -> float:
         return 0.0
     avg = total / 3.0
     return float(np.max(np.abs(load - avg)) / max(avg, 1e-9))
+
+
+def _shared_lv_line_unbalance_scores(edge_loads: dict[tuple[str, str], np.ndarray]) -> list[float]:
+    """Return unbalance scores for shared LV backbone segments only.
+
+    Service drops to individual users are excluded because they are single-phase by design
+    and are not meaningful ABC balance targets.
+    """
+
+    scores: list[float] = []
+    for (_, child), load in edge_loads.items():
+        if str(child).startswith("user_"):
+            continue
+        if float(load.sum()) <= 0.0:
+            continue
+        scores.append(_unbalance_ratio(load))
+    return scores

@@ -6,7 +6,7 @@ from shapely.geometry import Point
 
 from src.features.users_generator import generate_users
 from src.io.raster_io import build_raster_profile
-from src.planning.optimizer import optimize_distribution_network
+from src.planning.optimizer import _build_routing_graph, optimize_distribution_network
 
 
 def test_load_groups_generate_default_phase_interfaces() -> None:
@@ -89,6 +89,79 @@ def test_optimizer_outputs_radial_3d_plan_with_assigned_phases() -> None:
     assert not non_service["to_node"].astype(str).str.startswith("user_").any()
     assert (optimized.planned_lines["length_3d_m"] >= optimized.planned_lines["horizontal_length_m"]).all()
     assert "phase_balance" in optimized.summary
+    assert "max_shared_lv_line_unbalance_ratio" in optimized.summary["phase_balance"]
+    assert "mean_shared_lv_line_unbalance_ratio" in optimized.summary["phase_balance"]
+
+
+def test_optimizer_prefers_shared_backbone_and_shared_access_poles() -> None:
+    config = _scene_config()
+    profile = build_raster_profile(width=40, height=40, resolution=4.0, crs="EPSG:3857", origin_y=160.0)
+    dtm = np.tile(np.linspace(0.0, 15.0, 40, dtype=np.float32), (40, 1))
+    slope = np.zeros_like(dtm, dtype=np.float32)
+    roughness = np.zeros_like(dtm, dtype=np.float32)
+    buildable = np.ones_like(dtm, dtype=np.uint8)
+    forbidden = np.zeros_like(dtm, dtype=np.uint8)
+    users = gpd.GeoDataFrame(
+        {
+            "user_id": [1, 2, 3, 4, 5],
+            "load_kw": [7.0, 7.0, 7.0, 12.0, 12.0],
+            "power_factor": [0.85] * 5,
+            "phase_type": ["single"] * 5,
+            "assigned_phase": [""] * 5,
+            "apparent_kva": [7.0 / 0.85, 7.0 / 0.85, 7.0 / 0.85, 12.0 / 0.85, 12.0 / 0.85],
+            "importance": [1] * 5,
+            "elev_m": [0.0] * 5,
+        },
+        geometry=[
+            Point(28.0, 108.0),
+            Point(32.0, 104.0),
+            Point(36.0, 100.0),
+            Point(76.0, 56.0),
+            Point(80.0, 52.0),
+        ],
+        crs="EPSG:3857",
+    )
+
+    optimized = optimize_distribution_network(
+        config=config,
+        dtm=dtm,
+        slope=slope,
+        roughness=roughness,
+        buildable_mask=buildable,
+        forbidden_mask=forbidden,
+        profile=profile,
+        users=users,
+    )
+
+    service = optimized.planned_lines.loc[optimized.planned_lines["line_type"] == "service_drop"]
+    assert len(service) == len(users)
+    assert optimized.users["connected_node_id"].astype(str).nunique() < len(users)
+    assert not optimized.planned_lines.loc[
+        optimized.planned_lines["line_type"] == "lv_line"
+    ].empty
+
+
+def test_routing_graph_allows_diagonal_neighbors() -> None:
+    config = _scene_config()
+    config["planning"]["path_search_step_m"] = 4.0
+    profile = build_raster_profile(width=4, height=4, resolution=4.0, crs="EPSG:3857", origin_y=16.0)
+    dtm = np.zeros((4, 4), dtype=np.float32)
+    slope = np.zeros_like(dtm, dtype=np.float32)
+    roughness = np.zeros_like(dtm, dtype=np.float32)
+    buildable = np.ones_like(dtm, dtype=np.uint8)
+    forbidden = np.zeros_like(dtm, dtype=np.uint8)
+
+    context = _build_routing_graph(
+        config=config,
+        dtm=dtm,
+        slope=slope,
+        roughness=roughness,
+        buildable_mask=buildable,
+        forbidden_mask=forbidden,
+        profile=profile,
+    )
+
+    assert context.graph.has_edge("g_0_0", "g_1_1")
 
 
 def _scene_config() -> dict:

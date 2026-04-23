@@ -290,6 +290,14 @@ def build_scene_3d_overlays(
             subset = poles.loc[poles["pole_type"] == pole_type].copy()
             if subset.empty:
                 continue
+            lines.extend(
+                _build_vertical_support_overlays(
+                    gdf=subset,
+                    label=label,
+                    color=color,
+                    width=1.5,
+                )
+            )
             subset["render_z_m"] = subset["elev_m"].astype(np.float32) + subset["pole_height_m"].astype(np.float32)
             pole_points = _build_point_overlay(
                 gdf=subset,
@@ -670,6 +678,37 @@ def _build_user_point_overlays(
         )
         if overlay is not None:
             overlays.append(overlay)
+    return overlays
+
+
+def _build_vertical_support_overlays(
+    *,
+    gdf: gpd.GeoDataFrame | None,
+    label: str,
+    color: str,
+    width: float,
+) -> list[OverlayLine3D]:
+    """Render full pole shafts from ground to support top elevation."""
+
+    if gdf is None or gdf.empty or "elev_m" not in gdf.columns or "pole_height_m" not in gdf.columns:
+        return []
+
+    overlays: list[OverlayLine3D] = []
+    for row in gdf.itertuples():
+        x = float(row.geometry.x)
+        y = float(row.geometry.y)
+        ground_z = float(row.elev_m)
+        top_z = ground_z + float(row.pole_height_m)
+        overlays.append(
+            OverlayLine3D(
+                label=label,
+                x=np.asarray([x, x], dtype=np.float32),
+                y=np.asarray([y, y], dtype=np.float32),
+                z=np.asarray([ground_z, top_z], dtype=np.float32),
+                color=color,
+                width=width,
+            )
+        )
     return overlays
 
 
