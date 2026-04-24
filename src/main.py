@@ -20,7 +20,7 @@ from src.io.vector_io import (
     read_layer,
 )
 from src.planning.cost_surface import build_cost_surface
-from src.planning.optimizer import optimize_distribution_network
+from src.planning.optimizer_v2 import optimize_distribution_network_v2
 from src.terrain.terrain_derivatives import derive_terrain_layers
 from src.terrain.terrain_generator import generate_terrain
 from src.terrain.terrain_validator import terrain_statistics, validate_terrain_array
@@ -321,7 +321,7 @@ def optimize_plan(*, config: dict[str, Any], project_root: Path) -> dict[str, Pa
     write_geotiff(paths["forbidden_mask"], forbidden_mask, profile)
     write_geotiff(paths["buildable_mask"], buildable_mask, profile)
 
-    optimized = optimize_distribution_network(
+    optimized = optimize_distribution_network_v2(
         config=config,
         dtm=dtm,
         slope=slope,

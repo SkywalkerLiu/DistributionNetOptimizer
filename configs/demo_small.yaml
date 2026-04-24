@@ -88,6 +88,31 @@ planning:
   slope_weight: 2.0
   roughness_weight: 1.0
 
+planning_v2:
+  enable_v2_optimizer: true
+  tx_candidate_count: 12
+  tx_prefilter_top_k: 4
+  corridor_safe_margin_m: 8.0
+  corridor_cluster_count: 3
+  corridor_edge_max_length_m: 60.0
+  corridor_boundary_penalty_weight: 18.0
+  build_cost_weight: 1.0
+  loss_cost_weight: 1.0
+  phase_unbalance_weight: 3.0
+  tx_unbalance_weight: 2.0
+  segment_unbalance_weight: 1.0
+  max_service_drop_m: 25.0
+  max_pole_span_m: 50.0
+  voltage_drop_max_pct: 7.0
+  phase_balance_target_ratio: 0.10
+  phase_balance_max_ratio: 0.15
+  milp_time_limit_s: 60
+  alns_max_iter: 12
+  alns_destroy_ratio: 0.15
+  candidate_solution_pool_size: 6
+  show_progress: true
+  progress_bar_width: 32
+
 outputs:
   create_plots: true
 
