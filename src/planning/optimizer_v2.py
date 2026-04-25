@@ -721,6 +721,7 @@ def _evaluate_candidate_solution(
             edge_phase_kw={},
             edge_losses_kw={},
             edge_voltage_drop_pct={},
+            edge_phase_currents_a={},
             transformer_phase_loads=np.zeros(3, dtype=float),
             user_voltage_drop_pct={},
             user_service_drop_pct={},
@@ -759,13 +760,17 @@ def _evaluate_candidate_solution(
         users=users,
         planning_cfg=planning_cfg,
     )
-    voltage_ok, voltage_diagnostics, voltage_reasons = evaluate_solution_feasibility(
+    voltage_penalty, voltage_diagnostics = _voltage_drop_penalty(
+        power_flow=power_flow,
+        planning_cfg=planning_cfg,
+    )
+    voltage_ok, hard_constraint_diagnostics, hard_constraint_reasons = evaluate_solution_feasibility(
         users=users,
         power_flow=power_flow,
         planning_cfg=planning_cfg,
     )
-    diagnostics.extend(voltage_diagnostics)
-    infeasible_reasons.extend(voltage_reasons)
+    diagnostics.extend(hard_constraint_diagnostics)
+    infeasible_reasons.extend(hard_constraint_reasons)
 
     build_cost = _estimate_build_cost(
         tree=tree,
@@ -773,7 +778,8 @@ def _evaluate_candidate_solution(
         corridor=corridor,
         planning_cfg=planning_cfg,
     )
-    loss_cost = 0.0
+    loss_kw = float(power_flow.total_loss_kw)
+    loss_penalty = float(planning_cfg.get("loss_kw_weight", 10000.0)) * loss_kw
     unbalance_penalty = phase_unbalance_penalty(power_flow=power_flow, planning_cfg=planning_cfg)
     path_penalty, path_diagnostics = _path_length_penalty(
         tree=tree,
@@ -788,10 +794,11 @@ def _evaluate_candidate_solution(
     )
     objective = (
         float(planning_cfg.get("build_cost_weight", 1.0)) * build_cost
-        + float(planning_cfg.get("loss_cost_weight", 2.0)) * loss_cost
+        + loss_penalty
         + unbalance_penalty
         + path_penalty
         + root_feeder_penalty
+        + voltage_penalty
         + 1_000_000.0 * len(diagnostics)
     )
     return EvaluatedSolution(
@@ -801,7 +808,7 @@ def _evaluate_candidate_solution(
         phase_assignment=phase_assignment,
         power_flow=power_flow,
         build_cost=float(build_cost),
-        loss_cost=float(loss_cost),
+        loss_cost=float(loss_penalty),
         total_unbalance_penalty=float(unbalance_penalty),
         objective=float(objective),
         feasible=bool(voltage_ok and not diagnostics),
@@ -811,8 +818,58 @@ def _evaluate_candidate_solution(
         extra_metrics={
             "path_diagnostics": path_diagnostics,
             "root_feeder_diagnostics": root_feeder_diagnostics,
+            "voltage_diagnostics": voltage_diagnostics,
+            "loss_diagnostics": {
+                "total_loss_kw": round(float(loss_kw), 5),
+                "loss_kw_weight": round(float(planning_cfg.get("loss_kw_weight", 10000.0)), 5),
+                "loss_penalty": round(float(loss_penalty), 3),
+            },
         },
     )
+
+
+def _voltage_drop_penalty(
+    *,
+    power_flow: Any,
+    planning_cfg: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    """Return soft voltage-drop penalty and diagnostics.
+
+    Voltage drop must not affect feasibility directly.
+    """
+
+    reference_pct = float(
+        planning_cfg.get(
+            "voltage_drop_reference_pct",
+            planning_cfg.get("voltage_drop_max_pct", 7.0),
+        )
+    )
+    weight = float(planning_cfg.get("voltage_drop_penalty_weight", 50000.0))
+    warning_pct = float(planning_cfg.get("voltage_drop_warning_pct", 10.0))
+
+    max_total_drop = float(power_flow.max_voltage_drop_pct)
+    excess_pct = max(0.0, max_total_drop - reference_pct)
+
+    penalty = weight * (excess_pct / max(reference_pct, 1e-9)) ** 2
+
+    worst_user_id = None
+    if power_flow.user_voltage_drop_pct:
+        worst_user_id = max(
+            power_flow.user_voltage_drop_pct,
+            key=lambda user_id: float(power_flow.user_voltage_drop_pct[user_id]),
+        )
+
+    diagnostics = {
+        "voltage_drop_penalty": round(float(penalty), 3),
+        "reference_pct": round(float(reference_pct), 5),
+        "warning_pct": round(float(warning_pct), 5),
+        "max_total_voltage_drop_pct": round(float(max_total_drop), 5),
+        "worst_voltage_user_id": None if worst_user_id is None else int(worst_user_id),
+        "exceeds_reference": bool(max_total_drop > reference_pct + 1e-9),
+        "exceeds_warning": bool(max_total_drop > warning_pct + 1e-9),
+        "hard_constraint_enabled": False,
+    }
+    return float(penalty), diagnostics
 
 
 def _user_path_length_m(
@@ -1003,6 +1060,7 @@ def _resolve_planning_v2_config(config: dict[str, Any]) -> dict[str, Any]:
         "corridor_neighbor_count": 12,
         "corridor_boundary_penalty_weight": 20.0,
         "build_cost_weight": 1.0,
+        "loss_kw_weight": 10000.0,
         "path_length_penalty_weight": 20.0,
         "max_user_path_length_m": 300.0,
         "max_user_path_penalty_weight": 1000.0,
@@ -1017,6 +1075,10 @@ def _resolve_planning_v2_config(config: dict[str, Any]) -> dict[str, Any]:
         "pole_user_clearance_m": 5.0,
         "line_user_clearance_m": 1.0,
         "voltage_drop_max_pct": 7.0,
+        "voltage_drop_reference_pct": 7.0,
+        "voltage_drop_penalty_weight": 50000.0,
+        "voltage_drop_warning_pct": 10.0,
+        "voltage_drop_top_user_count": 10,
         "phase_balance_target_ratio": 0.10,
         "phase_balance_max_ratio": 0.15,
         "milp_time_limit_s": 8,

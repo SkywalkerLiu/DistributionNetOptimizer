@@ -97,6 +97,8 @@ planning_v2:
   corridor_neighbor_count: 12
   corridor_boundary_penalty_weight: 20.0
   build_cost_weight: 1.0
+  # 线损目标：线损以 kW 表示，使用权重进入 objective
+  loss_kw_weight: 10000.0
   path_length_penalty_weight: 20.0
   max_user_path_length_m: 300.0
   max_user_path_penalty_weight: 1000.0
@@ -111,6 +113,11 @@ planning_v2:
   pole_user_clearance_m: 5.0
   line_user_clearance_m: 1.0
   voltage_drop_max_pct: 7.0
+  # 压降只作为软惩罚和诊断，不作为 infeasible 判定
+  voltage_drop_reference_pct: 7.0
+  voltage_drop_penalty_weight: 50000.0
+  voltage_drop_warning_pct: 10.0
+  voltage_drop_top_user_count: 10
   phase_balance_target_ratio: 0.10
   phase_balance_max_ratio: 0.15
   milp_time_limit_s: 8

@@ -152,7 +152,15 @@ def test_optimizer_reports_balancing_loss_and_voltage_metrics() -> None:
     )
 
     assert optimized.summary["losses"]["total_loss_kw"] >= 0.0
-    assert optimized.summary["voltage"]["max_voltage_drop_pct"] >= 0.0
+    assert optimized.summary["losses"]["loss_penalty"] >= 0.0
+    assert "loss_penalty" in optimized.summary["objective"]
+    assert "voltage_drop_penalty" in optimized.summary["objective"]
+    assert optimized.summary["voltage"]["hard_constraint_enabled"] is False
+    assert optimized.summary["voltage"]["used_as_soft_penalty"] is True
+    assert optimized.summary["voltage"]["max_total_voltage_drop_pct"] >= 0.0
+    assert "top_voltage_drop_users" in optimized.summary["voltage"]
+    assert "max_phase_current_a" in optimized.summary["max_current_line"]
+    assert "loss_kw" in optimized.summary["max_current_line"]
     assert optimized.summary["phase_balance"]["transformer_unbalance_ratio"] <= config["planning_v2"]["phase_balance_max_ratio"] + 1e-9
 
 
@@ -197,6 +205,7 @@ def test_feasibility_reports_machine_readable_reason_codes() -> None:
         edge_phase_kw={},
         edge_losses_kw={},
         edge_voltage_drop_pct={},
+        edge_phase_currents_a={},
         transformer_phase_loads=np.asarray([30.0, 0.0, 0.0], dtype=float),
         user_voltage_drop_pct={1: 12.0},
         user_service_drop_pct={1: 0.5},
@@ -218,8 +227,7 @@ def test_feasibility_reports_machine_readable_reason_codes() -> None:
 
     assert not ok
     assert diagnostics
-    assert "voltage_drop_exceeded" in reasons
-    assert "phase_unbalance_exceeded" in reasons
+    assert reasons == ["phase_unbalance_exceeded"]
 
 
 def test_power_flow_user_voltage_drop_uses_only_service_drop() -> None:
@@ -279,12 +287,16 @@ def test_power_flow_user_voltage_drop_uses_only_service_drop() -> None:
         planning_cfg={},
     )
 
-    np.testing.assert_array_equal(result.edge_voltage_drop_pct[("root", "attach")], np.zeros(3, dtype=float))
-    assert result.edge_losses_kw[("root", "attach")] == 0.0
-    assert result.total_loss_kw == 0.0
-    assert result.user_voltage_drop_pct[1] == result.user_service_drop_pct[1]
+    np.testing.assert_allclose(
+        result.edge_phase_currents_a[("root", "attach")],
+        np.asarray([100.0 * 1000.0 / 230.0, 0.0, 0.0], dtype=float),
+    )
+    assert result.edge_voltage_drop_pct[("root", "attach")][0] > 0.0
+    assert result.edge_losses_kw[("root", "attach")] > 0.0
+    assert result.total_loss_kw > 0.0
+    assert result.user_voltage_drop_pct[1] > result.user_service_drop_pct[1]
     assert np.isclose(result.user_service_drop_pct[1], 15.0)
-    assert result.max_voltage_drop_pct == result.user_service_drop_pct[1]
+    assert result.max_voltage_drop_pct == result.user_voltage_drop_pct[1]
 
 
 def test_parallel_worker_auto_resolution(monkeypatch) -> None:

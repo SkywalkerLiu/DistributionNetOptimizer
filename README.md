@@ -4,7 +4,7 @@
 
 当前版本已经按 `PLAN_opt_V2.md` 完成优化器主架构重构，旧的“连续域路径搜索 + 可见图 + 路径后插杆”不再参与执行链路。项目现在统一采用：
 
-`候选走廊图 -> 径向树选边 -> 三相分配 -> 功率因数压降评估 -> 杆塔派生`
+`候选走廊图 -> 径向树选边 -> 三相分配 -> 功率流评估 -> 杆塔派生`
 
 ## 核心能力
 
@@ -13,7 +13,7 @@
 - 基于候选走廊图构建工程可行的低压布线候选网络
 - 在走廊图上选择配变位置、共享主干与分支树结构
 - 对单相用户进行 `A/B/C` 相别优化
-- 按用户负荷功率因数计算用户压降，输出相不平衡指标
+- 计算线路电流、线损、压降和相不平衡指标
 - 基于已选边自动派生杆塔与最终 `planned_lines` 图层
 - 在终端显示优化进度条，观察候选评估和局部搜索进度
 - 输出 `GeoPackage`、2D 图和 3D 图
@@ -30,7 +30,7 @@ src/planning/
   attachment_model.py        # 用户接入候选
   radial_tree_milp.py        # Pyomo + HiGHS 径向树 MILP 求解
   phase_assignment.py        # 三相分配优化
-  bfs_power_flow.py          # 相负荷汇总与功率因数压降评估
+  bfs_power_flow.py          # 相负荷汇总、线路电流、线损与压降评估
   voltage_eval.py            # 约束检查与不平衡惩罚
   pole_generation.py         # 杆塔与线路图层派生
   geometry_constraints.py    # 走廊与净空几何约束
@@ -102,7 +102,7 @@ python -m src.main plot-plan --config configs/default_config.yaml
 - `corridor_cluster_count`：用户簇数量
 - `corridor_edge_max_length_m`：候选走廊边最大长度
 - `build_cost_weight` / `phase_unbalance_weight`：目标函数权重
-- `max_service_drop_m` / `max_pole_span_m` / `voltage_drop_max_pct`：硬约束；其中 `voltage_drop_max_pct` 只检查用户负荷功率因数压降
+- `max_service_drop_m` / `max_pole_span_m`：接户线长度和杆距硬约束；`voltage_drop_max_pct` 仅作为旧配置兼容的压降参考值
 - `pole_user_clearance_m`：杆塔/配变候选点到用户点的最小水平净距，默认 `5.0m`
 - `line_user_clearance_m`：公共低压线路到用户点的最小水平净距，默认 `1.0m`；接户线允许连接自己的用户点，但仍会避让其他用户点
 - `solver_backend`：当前仅支持 `highs`
@@ -154,16 +154,19 @@ planning_v2:
 - 调试复现：设置 `parallel_workers: 1` 或 `parallel_candidate_eval: false`，让候选评估串行执行。
 - 多进程受限环境：建议保持默认串行配置，避免 Windows sandbox 或权限策略阻止创建进程池。
 
-## 压降口径
+### V2 线损与压降处理
 
-当前版本只按用户负荷功率因数计算压降，并写入用户 `voltage_drop_pct` 和 `summary.voltage.max_voltage_drop_pct`。共享低压主干/分支线路、接户线长度、线路电阻和线路电抗都不参与压降计算，也不会触发 `voltage_drop_exceeded`。这个改动没有保留旧口径的配置开关或兼容回退。
+V2 保留线路阻抗、负载电流、线损和压降计算。
 
-线路长度、电阻、电抗相关的线损计算也已移除，`summary.losses.total_loss_kw` 和目标函数中的 `loss_cost` 固定为 `0`。配置中不再包含 `line_resistance_ohm_per_km`、`line_reactance_ohm_per_km`、`voltage_drop_optimization_weight` 或 `loss_cost_weight`。
-
-`planned_lines` 中：
-
-- `lv_line` 的 `voltage_drop_pct` 固定为 `0`
-- `service_drop` 的 `voltage_drop_pct` 为该用户负荷功率因数压降
+- 线损以有功功率损耗 `kW` 表示；
+- 线损通过 `loss_kw_weight` 进入优化目标；
+- 不使用电价或运行小时折算线损；
+- 压降不作为硬约束；
+- 压降超限不会导致 `infeasible`；
+- 压降通过 `voltage_drop_penalty_weight` 作为软惩罚进入目标函数；
+- summary 中输出压降较大的用户；
+- summary 中输出台区电流最大的线路段及其 A/B/C 三相电流；
+- 接户线压降不单独记录。
 
 执行完成后，可在 `data/outputs/plans/optimization_summary.json` 的 `performance` 字段查看阶段耗时和 MILP 调用次数，例如：
 
@@ -186,7 +189,6 @@ planning_v2:
 
 ```yaml
 infeasible_reason:
-  - voltage_drop_exceeded
   - service_drop_too_long
   - no_corridor_to_user_17
   - phase_unbalance_exceeded
@@ -194,7 +196,6 @@ infeasible_reason:
 
 当前已覆盖的主要 reason code 包括：
 
-- `voltage_drop_exceeded`
 - `service_drop_too_long`
 - `phase_unbalance_exceeded`
 - `transformer_overloaded`
@@ -218,7 +219,7 @@ infeasible_reason:
 - `lv_line`：主干/分支低压线路
 - `service_drop`：用户接户线
 - `load_a_kva / load_b_kva / load_c_kva`
-- `voltage_drop_pct`：`lv_line` 为 `0`，`service_drop` 为用户负荷功率因数压降
+- `voltage_drop_pct`：线路和用户侧压降诊断值
 - `min_clearance_m / required_clearance_m`
 - `user_clearance_m / required_user_clearance_m`
 - `violation_reason`
@@ -238,7 +239,7 @@ python -m pytest -q
 - 杆塔水平避让用户 `5m`，公共线路水平避让用户 `1m`
 - V2 优化输出保持径向树结构
 - 用户接户线长度约束
-- 相别分配与功率因数压降指标输出
+- 相别分配、线损和压降诊断指标输出
 - 不可行 reason code 输出
 - 两阶段候选评估、性能指标和并行 worker 配置
 - 终端进度条输出

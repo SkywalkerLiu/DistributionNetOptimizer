@@ -112,6 +112,7 @@ class PowerFlowResult:
     edge_phase_kw: dict[tuple[str, str], np.ndarray]
     edge_losses_kw: dict[tuple[str, str], float]
     edge_voltage_drop_pct: dict[tuple[str, str], np.ndarray]
+    edge_phase_currents_a: dict[tuple[str, str], np.ndarray]
     transformer_phase_loads: np.ndarray
     user_voltage_drop_pct: dict[int, float]
     user_service_drop_pct: dict[int, float]

@@ -62,8 +62,12 @@ def build_summary_v2(
         "objective": {
             "total": round(float(solution.objective), 3),
             "build_cost": round(float(solution.build_cost), 3),
-            "loss_cost": round(float(solution.loss_cost), 3),
+            "loss_penalty": round(float(solution.loss_cost), 3),
             "unbalance_penalty": round(float(solution.total_unbalance_penalty), 3),
+            "voltage_drop_penalty": round(
+                float(solution.extra_metrics.get("voltage_diagnostics", {}).get("voltage_drop_penalty", 0.0)),
+                3,
+            ),
         },
         "corridor": {
             "node_count": int(len(corridor.nodes)),
@@ -108,16 +112,104 @@ def build_summary_v2(
         },
         "losses": {
             "total_loss_kw": round(float(solution.power_flow.total_loss_kw), 5),
+            "loss_kw_weight": round(float(planning_cfg.get("loss_kw_weight", 10000.0)), 5),
+            "loss_penalty": round(float(solution.loss_cost), 3),
         },
-        "voltage": {
-            "max_voltage_drop_pct": round(float(solution.power_flow.max_voltage_drop_pct), 5),
-        },
+        "voltage": _voltage_summary(solution=solution, planning_cfg=planning_cfg),
+        "max_current_line": _max_current_line_summary(corridor=corridor, solution=solution),
         "path_diagnostics": solution.extra_metrics.get("path_diagnostics", {}),
         "root_feeder_diagnostics": solution.extra_metrics.get("root_feeder_diagnostics", {}),
         "users": {
             "count": int(len(users)),
             "connected_count": int(users["connected_node_id"].astype(str).ne("").sum()) if "connected_node_id" in users.columns else 0,
         },
+    }
+
+
+def _voltage_summary(
+    *,
+    solution: EvaluatedSolution,
+    planning_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    power_flow = solution.power_flow
+    diag = solution.extra_metrics.get("voltage_diagnostics", {})
+    top_count = int(planning_cfg.get("voltage_drop_top_user_count", 10))
+
+    ranked_users = sorted(
+        power_flow.user_voltage_drop_pct,
+        key=lambda user_id: float(power_flow.user_voltage_drop_pct[user_id]),
+        reverse=True,
+    )
+
+    top_users = [
+        {
+            "user_id": int(user_id),
+            "phase": str(solution.phase_assignment.get(int(user_id), "")),
+            "total_voltage_drop_pct": round(float(power_flow.user_voltage_drop_pct[user_id]), 5),
+            "connection_node_id": str(power_flow.user_connection_nodes.get(int(user_id), "")),
+        }
+        for user_id in ranked_users[:top_count]
+    ]
+
+    return {
+        "hard_constraint_enabled": False,
+        "used_as_soft_penalty": True,
+        "reference_pct": diag.get(
+            "reference_pct",
+            float(
+                planning_cfg.get(
+                    "voltage_drop_reference_pct",
+                    planning_cfg.get("voltage_drop_max_pct", 7.0),
+                )
+            ),
+        ),
+        "warning_pct": diag.get("warning_pct", float(planning_cfg.get("voltage_drop_warning_pct", 10.0))),
+        "max_total_voltage_drop_pct": round(float(power_flow.max_voltage_drop_pct), 5),
+        "voltage_drop_penalty": diag.get("voltage_drop_penalty", 0.0),
+        "worst_voltage_user_id": diag.get("worst_voltage_user_id"),
+        "top_voltage_drop_users": top_users,
+    }
+
+
+def _max_current_line_summary(
+    *,
+    corridor: CorridorGraph,
+    solution: EvaluatedSolution,
+) -> dict[str, Any]:
+    power_flow = solution.power_flow
+    if not power_flow.edge_phase_currents_a:
+        return {}
+
+    max_edge = max(
+        power_flow.edge_phase_currents_a,
+        key=lambda edge: float(np.max(power_flow.edge_phase_currents_a[edge])),
+    )
+
+    currents = np.asarray(power_flow.edge_phase_currents_a[max_edge], dtype=float)
+    loads = np.asarray(power_flow.edge_phase_loads.get(max_edge, np.zeros(3)), dtype=float)
+    kws = np.asarray(power_flow.edge_phase_kw.get(max_edge, np.zeros(3)), dtype=float)
+    loss_kw = float(power_flow.edge_losses_kw.get(max_edge, 0.0))
+
+    parent, child = max_edge
+    edge_id = str(corridor.graph[parent][child]["edge_id"])
+    corridor_edge = corridor.edges[edge_id]
+
+    return {
+        "edge_id": edge_id,
+        "parent_node_id": str(parent),
+        "child_node_id": str(child),
+        "length_3d_m": round(float(corridor_edge.length_3d_m), 3),
+        "max_phase_current_a": round(float(np.max(currents)), 3),
+        "current_a_a": round(float(currents[0]), 3),
+        "current_b_a": round(float(currents[1]), 3),
+        "current_c_a": round(float(currents[2]), 3),
+        "load_a_kva": round(float(loads[0]), 3),
+        "load_b_kva": round(float(loads[1]), 3),
+        "load_c_kva": round(float(loads[2]), 3),
+        "load_a_kw": round(float(kws[0]), 3),
+        "load_b_kw": round(float(kws[1]), 3),
+        "load_c_kw": round(float(kws[2]), 3),
+        "loss_kw": round(loss_kw, 5),
     }
 
 

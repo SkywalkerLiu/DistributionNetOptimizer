@@ -13,7 +13,11 @@ def evaluate_solution_feasibility(
     power_flow: PowerFlowResult,
     planning_cfg: dict[str, Any],
 ) -> tuple[bool, list[str], list[str]]:
-    """Evaluate hard planning constraints on the candidate solution."""
+    """Evaluate hard electrical constraints.
+
+    Voltage drop is not a hard constraint in V2. It is handled as a soft
+    penalty and diagnostic metric by the optimizer and summary layers.
+    """
 
     diagnostics: list[str] = []
     infeasible_reasons: list[str] = []
@@ -26,13 +30,6 @@ def evaluate_solution_feasibility(
             f"Transformer loading {transformer_load:.2f} kVA exceeds limit {capacity_limit:.2f} kVA."
         )
         infeasible_reasons.append("transformer_overloaded")
-
-    voltage_limit = float(planning_cfg.get("voltage_drop_max_pct", 7.0))
-    if power_flow.max_voltage_drop_pct > voltage_limit + 1e-9:
-        diagnostics.append(
-            f"Maximum voltage drop {power_flow.max_voltage_drop_pct:.2f}% exceeds limit {voltage_limit:.2f}%."
-        )
-        infeasible_reasons.append("voltage_drop_exceeded")
 
     balance_limit = float(planning_cfg.get("phase_balance_max_ratio", 0.15))
     imbalance = phase_unbalance_ratio(power_flow.transformer_phase_loads)
