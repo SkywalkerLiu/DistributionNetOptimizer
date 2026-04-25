@@ -3,12 +3,13 @@ from __future__ import annotations
 import networkx as nx
 import geopandas as gpd
 import numpy as np
-from shapely.geometry import Point
+from shapely.geometry import LineString, Point
 
 from src.io.raster_io import build_raster_profile
+from src.planning.bfs_power_flow import run_backward_forward_sweep
 from src.planning.corridor_graph import build_corridor_graph
 from src.planning.geometry_constraints import segment_is_feasible
-from src.planning.models import PowerFlowResult
+from src.planning.models import AttachmentOption, CorridorEdge, CorridorGraph, CorridorNode, PowerFlowResult, RadialTreeResult
 from src.planning.optimizer import optimize_distribution_network
 from src.planning.optimizer_v2 import _resolve_parallel_workers
 from src.planning.voltage_eval import evaluate_solution_feasibility
@@ -221,6 +222,71 @@ def test_feasibility_reports_machine_readable_reason_codes() -> None:
     assert "phase_unbalance_exceeded" in reasons
 
 
+def test_power_flow_user_voltage_drop_uses_only_service_drop() -> None:
+    graph = nx.Graph()
+    graph.add_edge("root", "attach", edge_id="e1")
+    corridor = CorridorGraph(
+        graph=graph,
+        nodes={
+            "root": CorridorNode("root", 0.0, 0.0, 0.0, 0, 0, "tx"),
+            "attach": CorridorNode("attach", 1000.0, 0.0, 0.0, 0, 1000, "pole"),
+        },
+        edges={
+            "e1": CorridorEdge(
+                edge_id="e1",
+                u="root",
+                v="attach",
+                geometry=LineString([(0.0, 0.0), (1000.0, 0.0)]),
+                horizontal_length_m=1000.0,
+                length_3d_m=1000.0,
+                build_cost=1000.0,
+                terrain_cost=0.0,
+                risk_cost=0.0,
+                max_span_feasible=True,
+                is_forbidden=False,
+                slope_deg=0.0,
+                boundary_clearance_m=20.0,
+            )
+        },
+        corridor_mask=np.ones((2, 2), dtype=np.uint8),
+        boundary_distance_m=np.ones((2, 2), dtype=np.float32),
+        resolution_m=1.0,
+    )
+    tree = RadialTreeResult(
+        root_node_id="root",
+        selected_edge_ids=["e1"],
+        parent_by_node={"attach": "root"},
+        depth_by_node={"root": 0, "attach": 1},
+        terminal_nodes={"attach"},
+    )
+    users = _users([(1, 1010.0, 0.0, 7.0)])
+    option = AttachmentOption(
+        user_id=1,
+        attach_node_id="attach",
+        horizontal_length_m=10.0,
+        length_3d_m=10.0,
+        cost=10.0,
+    )
+
+    result = run_backward_forward_sweep(
+        corridor=corridor,
+        tree=tree,
+        attachment_choices={1: option},
+        assignments={1: "A"},
+        edge_phase_loads={("root", "attach"): np.asarray([100.0, 0.0, 0.0], dtype=float)},
+        edge_phase_kw={("root", "attach"): np.asarray([85.0, 0.0, 0.0], dtype=float)},
+        users=users,
+        planning_cfg={},
+    )
+
+    np.testing.assert_array_equal(result.edge_voltage_drop_pct[("root", "attach")], np.zeros(3, dtype=float))
+    assert result.edge_losses_kw[("root", "attach")] == 0.0
+    assert result.total_loss_kw == 0.0
+    assert result.user_voltage_drop_pct[1] == result.user_service_drop_pct[1]
+    assert np.isclose(result.user_service_drop_pct[1], 15.0)
+    assert result.max_voltage_drop_pct == result.user_service_drop_pct[1]
+
+
 def test_parallel_worker_auto_resolution(monkeypatch) -> None:
     monkeypatch.setattr("src.planning.optimizer_v2.os.cpu_count", lambda: 8)
     assert _resolve_parallel_workers(
@@ -293,8 +359,6 @@ def _config() -> dict:
             "phase_balance_max_ratio": 0.25,
             "voltage_drop_max_pct": 20.0,
             "low_voltage_phase_v": 230.0,
-            "line_resistance_ohm_per_km": 0.642,
-            "line_reactance_ohm_per_km": 0.083,
             "lv_ground_clearance_m": 2.5,
             "service_ground_clearance_m": 2.0,
             "clearance_sample_step_m": 2.0,
@@ -308,7 +372,6 @@ def _config() -> dict:
             "corridor_edge_max_length_m": 40.0,
             "corridor_boundary_penalty_weight": 16.0,
             "build_cost_weight": 1.0,
-            "loss_cost_weight": 0.01,
             "phase_unbalance_weight": 1.0,
             "tx_unbalance_weight": 1.0,
             "segment_unbalance_weight": 0.5,

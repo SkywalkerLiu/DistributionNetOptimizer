@@ -72,9 +72,6 @@ planning:
   low_voltage_phase_v: 230.0
   low_voltage_line_v: 400.0
   voltage_drop_max_pct: 7.0
-  voltage_drop_optimization_weight: 0.5
-  line_resistance_ohm_per_km: 0.6
-  line_reactance_ohm_per_km: 0.35
   lv_ground_clearance_m: 4.0
   service_ground_clearance_m: 2.3
   clearance_sample_step_m: 2.0
@@ -97,7 +94,6 @@ planning_v2:
   corridor_edge_max_length_m: 60.0
   corridor_boundary_penalty_weight: 18.0
   build_cost_weight: 1.0
-  loss_cost_weight: 1.0
   phase_unbalance_weight: 3.0
   tx_unbalance_weight: 2.0
   segment_unbalance_weight: 1.0

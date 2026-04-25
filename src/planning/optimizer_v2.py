@@ -14,7 +14,6 @@ from src.planning.attachment_model import build_attachment_options, select_initi
 from src.planning.bfs_power_flow import run_backward_forward_sweep
 from src.planning.common import sample_array
 from src.planning.corridor_graph import build_corridor_graph
-from src.planning.loss_eval import loss_cost_from_power
 from src.planning.models import EvaluatedSolution, OptimizedPlan
 from src.planning.neighborhood_search import improve_attachment_choices
 from src.planning.phase_assignment import optimize_phase_assignment
@@ -774,11 +773,9 @@ def _evaluate_candidate_solution(
         corridor=corridor,
         planning_cfg=planning_cfg,
     )
-    loss_cost = loss_cost_from_power(total_loss_kw=power_flow.total_loss_kw, planning_cfg=planning_cfg)
     unbalance_penalty = phase_unbalance_penalty(power_flow=power_flow, planning_cfg=planning_cfg)
     objective = (
         float(planning_cfg.get("build_cost_weight", 1.0)) * build_cost
-        + float(planning_cfg.get("loss_cost_weight", 2.0)) * loss_cost
         + unbalance_penalty
         + 1_000_000.0 * len(diagnostics)
     )
@@ -789,7 +786,7 @@ def _evaluate_candidate_solution(
         phase_assignment=phase_assignment,
         power_flow=power_flow,
         build_cost=float(build_cost),
-        loss_cost=float(loss_cost),
+        loss_cost=0.0,
         total_unbalance_penalty=float(unbalance_penalty),
         objective=float(objective),
         feasible=bool(voltage_ok and not diagnostics),
@@ -870,7 +867,6 @@ def _resolve_planning_v2_config(config: dict[str, Any]) -> dict[str, Any]:
         "corridor_edge_max_length_m": 180.0,
         "corridor_boundary_penalty_weight": 20.0,
         "build_cost_weight": 1.0,
-        "loss_cost_weight": 2.0,
         "phase_unbalance_weight": 3.0,
         "tx_unbalance_weight": 2.0,
         "segment_unbalance_weight": 1.0,
