@@ -93,10 +93,15 @@ def test_optimizer_outputs_v2_radial_plan() -> None:
     )
 
     assert optimized.summary["algorithm"] == "planning_v2"
+    assert optimized.summary["infeasible_reasons"] == []
     assert optimized.summary["infeasible_reason"] == []
+    assert "top_diagnostics" in optimized.summary
+    assert "violation_examples" in optimized.summary
+    assert optimized.summary["final_geometry_checked_solution_count"] >= 1
     assert optimized.summary["performance"]["initial_candidate_count"] == config["planning_v2"]["tx_prefilter_top_k"]
     assert optimized.summary["performance"]["local_search_candidate_count"] == config["planning_v2"]["local_search_top_k"]
     assert optimized.summary["performance"]["milp_solve_count"] >= config["planning_v2"]["tx_prefilter_top_k"]
+    assert "local_search_full_eval_count" in optimized.summary["performance"]
     assert len(optimized.transformer) == 1
     assert not optimized.poles.empty
     assert not optimized.planned_lines.empty

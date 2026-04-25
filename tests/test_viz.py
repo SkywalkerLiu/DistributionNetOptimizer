@@ -31,6 +31,23 @@ def test_downsample_terrain_surface_limits_grid_size() -> None:
     assert surface.original_width == 30
 
 
+def test_downsample_terrain_surface_can_use_original_grid() -> None:
+    dtm = np.arange(600, dtype=np.float32).reshape(20, 30)
+    profile = build_raster_profile(
+        width=30,
+        height=20,
+        resolution=2.0,
+        crs="EPSG:3857",
+        origin_x=0.0,
+        origin_y=40.0,
+    )
+
+    surface = downsample_terrain_surface(dtm=dtm, profile=profile, max_grid_size=0)
+
+    assert surface.z.shape == dtm.shape
+    np.testing.assert_array_equal(surface.z, dtm)
+
+
 def test_generate_terrain_3d_previews_writes_png_and_html() -> None:
     tmp_path = _workspace_tmpdir("viz3d")
     dtm = np.linspace(0.0, 100.0, num=24 * 18, dtype=np.float32).reshape(24, 18)

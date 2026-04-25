@@ -337,6 +337,10 @@ def optimize_plan(*, config: dict[str, Any], project_root: Path) -> dict[str, Pa
     overwrite_layer(paths["features"], "candidate_poles", optimized.poles)
     overwrite_layer(paths["features"], "planned_lines", optimized.planned_lines)
     write_json(paths["optimization_summary"], optimized.summary)
+    if not bool(optimized.summary.get("feasible", False)):
+        reasons = optimized.summary.get("infeasible_reasons") or optimized.summary.get("infeasible_reason") or []
+        reason_text = ",".join(str(reason) for reason in reasons[:3]) if reasons else "unknown_reason"
+        print(f"Optimization infeasible | reason={reason_text}; see {paths['optimization_summary']}")
 
     generate_optimized_plan_plots(
         dtm=dtm,

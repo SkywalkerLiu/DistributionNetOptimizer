@@ -35,6 +35,22 @@ class CandidateEvaluationResult:
     duration_s: float
     milp_solve_count: int
     milp_cache_hit_count: int
+    local_search_trial_count: int = 0
+    local_search_full_eval_count: int = 0
+
+
+@dataclass(slots=True)
+class FinalGeometrySelection:
+    """A solution after final layer generation and geometry summary checks."""
+
+    solution: EvaluatedSolution
+    users: gpd.GeoDataFrame
+    transformer_layer: gpd.GeoDataFrame
+    poles_layer: gpd.GeoDataFrame
+    planned_lines: gpd.GeoDataFrame
+    user_connection_public: dict[int, str]
+    summary: dict[str, Any]
+    checked_index: int
 
 
 _WORKER_CONTEXT: dict[str, Any] = {}
@@ -159,39 +175,29 @@ def optimize_distribution_network_v2(
 
     if not solutions:
         raise ValueError("The V2 optimizer could not generate any candidate solutions.")
-    solutions.sort(key=lambda item: (not item.feasible, item.objective))
-    best = solutions[0]
-
     progress.stage(
         progress=0.96,
-        label="生成输出图层",
-        detail="杆塔、线路和 summary 落图中",
+        label="输出复核",
+        detail="geometry check and summary",
     )
     output_started_at = time.perf_counter()
-    transformer_layer, poles_layer, planned_lines, user_connection_public = generate_plan_layers(
+    geometry_selection = _select_final_solution_with_geometry_check(
+        solutions=solutions,
         corridor=corridor,
-        solution=best,
         users=users,
         dtm=dtm,
         profile=profile,
         planning_cfg=planning_cfg,
         crs=profile["crs"],
+        top_k=int(planning_cfg.get("final_geometry_check_top_k", 8)),
     )
-    users = users.copy()
-    users["assigned_phase"] = users["user_id"].map(lambda value: best.phase_assignment.get(int(value), ""))
-    users["connected_node_id"] = users["user_id"].map(lambda value: user_connection_public.get(int(value), ""))
-    users["voltage_drop_pct"] = users["user_id"].map(
-        lambda value: best.power_flow.user_voltage_drop_pct.get(int(value), 0.0)
-    )
+    best = geometry_selection.solution
+    users = geometry_selection.users
+    transformer_layer = geometry_selection.transformer_layer
+    poles_layer = geometry_selection.poles_layer
+    planned_lines = geometry_selection.planned_lines
+    summary = geometry_selection.summary
     output_duration_s = time.perf_counter() - output_started_at
-    summary = build_summary_v2(
-        corridor=corridor,
-        solution=best,
-        users=users,
-        poles=poles_layer,
-        planned_lines=planned_lines,
-        planning_cfg=planning_cfg,
-    )
     if bool(planning_cfg.get("emit_performance_metrics", True)):
         summary["performance"] = _build_performance_summary(
             total_duration_s=time.perf_counter() - total_started_at,
@@ -206,9 +212,7 @@ def optimize_distribution_network_v2(
             local_search_top_k=local_search_top_k,
             planning_cfg=planning_cfg,
         )
-    progress.finish(
-        detail=f"最优 obj={best.objective:.1f} | {'feasible' if summary['feasible'] else 'infeasible'}",
-    )
+    progress.finish(detail=_finish_detail(objective=best.objective, summary=summary))
     return OptimizedPlan(
         users=users,
         transformer=transformer_layer,
@@ -446,6 +450,10 @@ def _improve_candidate_direct(
         evaluate=evaluate,
         max_iter=int(planning_cfg.get("alns_max_iter", 40)),
         destroy_ratio=float(planning_cfg.get("alns_destroy_ratio", 0.15)),
+        patience=int(planning_cfg.get("local_search_patience", 8)),
+        top_options=int(planning_cfg.get("local_search_top_options", 5)),
+        max_full_evals=int(planning_cfg.get("local_search_max_full_evals", 200)),
+        performance_counters=counters,
         progress_callback=None
         if progress is None
         else lambda iteration, max_iter, changed, current_best: progress.candidate_iteration(
@@ -463,6 +471,8 @@ def _improve_candidate_direct(
         duration_s=time.perf_counter() - started_at,
         milp_solve_count=int(counters.get("milp_solve_count", 0)),
         milp_cache_hit_count=int(counters.get("milp_cache_hit_count", 0)),
+        local_search_trial_count=int(counters.get("local_search_trial_count", 0)),
+        local_search_full_eval_count=int(counters.get("local_search_full_eval_count", 0)),
     )
 
 
@@ -499,6 +509,158 @@ def _improve_candidate_worker(initial_result: CandidateEvaluationResult) -> Cand
         radial_model_data=_WORKER_CONTEXT["radial_model_data"],
         progress=None,
     )
+
+
+def _select_final_solution_with_geometry_check(
+    *,
+    solutions: list[EvaluatedSolution],
+    corridor: Any,
+    users: gpd.GeoDataFrame,
+    dtm: np.ndarray,
+    profile: dict[str, Any],
+    planning_cfg: dict[str, Any],
+    crs: Any,
+    top_k: int,
+) -> FinalGeometrySelection:
+    """Generate final layers for top solutions and pick one that passes geometry checks."""
+
+    ranked = sorted(solutions, key=lambda item: (not item.feasible, item.objective))
+    bounded_top_k = max(1, min(int(top_k), len(ranked)))
+    checked: list[FinalGeometrySelection] = []
+    first_solution = ranked[0]
+    for checked_index, solution in enumerate(ranked[:bounded_top_k], start=1):
+        selection = _build_geometry_selection(
+            solution=solution,
+            corridor=corridor,
+            users=users,
+            dtm=dtm,
+            profile=profile,
+            planning_cfg=planning_cfg,
+            crs=crs,
+            checked_index=checked_index,
+        )
+        checked.append(selection)
+        if bool(selection.summary.get("feasible", False)):
+            _annotate_geometry_check_summary(
+                summary=selection.summary,
+                checked_count=len(checked),
+                top_k=bounded_top_k,
+                selected_after_geometry_check=solution is not first_solution,
+                selected_geometry_check_index=checked_index,
+            )
+            return selection
+
+    checked.sort(key=_geometry_fallback_key)
+    selected = checked[0]
+    _annotate_geometry_check_summary(
+        summary=selected.summary,
+        checked_count=len(checked),
+        top_k=bounded_top_k,
+        selected_after_geometry_check=selected.solution is not first_solution,
+        selected_geometry_check_index=selected.checked_index,
+    )
+    return selected
+
+
+def _build_geometry_selection(
+    *,
+    solution: EvaluatedSolution,
+    corridor: Any,
+    users: gpd.GeoDataFrame,
+    dtm: np.ndarray,
+    profile: dict[str, Any],
+    planning_cfg: dict[str, Any],
+    crs: Any,
+    checked_index: int,
+) -> FinalGeometrySelection:
+    transformer_layer, poles_layer, planned_lines, user_connection_public = generate_plan_layers(
+        corridor=corridor,
+        solution=solution,
+        users=users,
+        dtm=dtm,
+        profile=profile,
+        planning_cfg=planning_cfg,
+        crs=crs,
+    )
+    annotated_users = _annotate_users_for_solution(
+        users=users,
+        solution=solution,
+        user_connection_public=user_connection_public,
+    )
+    summary = build_summary_v2(
+        corridor=corridor,
+        solution=solution,
+        users=annotated_users,
+        poles=poles_layer,
+        planned_lines=planned_lines,
+        planning_cfg=planning_cfg,
+    )
+    return FinalGeometrySelection(
+        solution=solution,
+        users=annotated_users,
+        transformer_layer=transformer_layer,
+        poles_layer=poles_layer,
+        planned_lines=planned_lines,
+        user_connection_public=user_connection_public,
+        summary=summary,
+        checked_index=checked_index,
+    )
+
+
+def _annotate_users_for_solution(
+    *,
+    users: gpd.GeoDataFrame,
+    solution: EvaluatedSolution,
+    user_connection_public: dict[int, str],
+) -> gpd.GeoDataFrame:
+    annotated = users.copy()
+    annotated["assigned_phase"] = annotated["user_id"].map(
+        lambda value: solution.phase_assignment.get(int(value), "")
+    )
+    annotated["connected_node_id"] = annotated["user_id"].map(
+        lambda value: user_connection_public.get(int(value), "")
+    )
+    annotated["voltage_drop_pct"] = annotated["user_id"].map(
+        lambda value: solution.power_flow.user_voltage_drop_pct.get(int(value), 0.0)
+    )
+    return annotated
+
+
+def _annotate_geometry_check_summary(
+    *,
+    summary: dict[str, Any],
+    checked_count: int,
+    top_k: int,
+    selected_after_geometry_check: bool,
+    selected_geometry_check_index: int,
+) -> None:
+    summary["final_geometry_checked_solution_count"] = int(checked_count)
+    summary["final_geometry_check_top_k"] = int(top_k)
+    summary["selected_after_geometry_check"] = bool(selected_after_geometry_check)
+    summary["selected_geometry_check_index"] = int(selected_geometry_check_index)
+
+
+def _geometry_fallback_key(selection: FinalGeometrySelection) -> tuple[int, int, int, int, int, float]:
+    summary = selection.summary
+    reasons = summary.get("infeasible_reasons") or summary.get("infeasible_reason") or []
+    line_violation_count = int(summary.get("line_totals", {}).get("violation_count", 0))
+    pole_violation_count = int(summary.get("poles", {}).get("user_clearance_violation_count", 0))
+    return (
+        line_violation_count + pole_violation_count,
+        line_violation_count,
+        pole_violation_count,
+        int(not selection.solution.feasible),
+        len(reasons),
+        float(selection.solution.objective),
+    )
+
+
+def _finish_detail(*, objective: float, summary: dict[str, Any]) -> str:
+    if bool(summary.get("feasible", False)):
+        return f"best obj={objective:.1f} | feasible"
+    reasons = summary.get("infeasible_reasons") or summary.get("infeasible_reason") or []
+    reason_text = ",".join(str(reason) for reason in reasons[:3]) if reasons else "unknown_reason"
+    return f"best obj={objective:.1f} | infeasible | reason={reason_text}"
 
 
 def _evaluate_candidate_solution(
@@ -701,7 +863,7 @@ def _resolve_planning_v2_config(config: dict[str, Any]) -> dict[str, Any]:
 
     planning_defaults = {
         "enable_v2_optimizer": True,
-        "tx_candidate_count": 20,
+        "tx_candidate_count": 60,
         "tx_prefilter_top_k": 6,
         "corridor_safe_margin_m": 12.0,
         "corridor_cluster_count": 6,
@@ -719,17 +881,21 @@ def _resolve_planning_v2_config(config: dict[str, Any]) -> dict[str, Any]:
         "voltage_drop_max_pct": 7.0,
         "phase_balance_target_ratio": 0.10,
         "phase_balance_max_ratio": 0.15,
-        "milp_time_limit_s": 180,
+        "milp_time_limit_s": 8,
         "solver_backend": "highs",
-        "mip_gap": 0.05,
-        "parallel_candidate_eval": True,
-        "parallel_workers": 0,
+        "mip_gap": 0.15,
+        "parallel_candidate_eval": False,
+        "parallel_workers": 1,
         "highs_threads_per_worker": 1,
-        "local_search_top_k": 8,
+        "local_search_top_k": 1,
+        "local_search_patience": 2,
+        "local_search_top_options": 1,
+        "local_search_max_full_evals": 8,
         "emit_performance_metrics": True,
-        "alns_max_iter": 40,
+        "alns_max_iter": 20,
         "alns_destroy_ratio": 0.15,
-        "candidate_solution_pool_size": 10,
+        "candidate_solution_pool_size": 6,
+        "final_geometry_check_top_k": 6,
         "show_progress": True,
         "progress_bar_width": 32,
     }
@@ -801,6 +967,11 @@ def _build_performance_summary(
         "local_search_top_k": int(local_search_top_k),
         "milp_solve_count": int(sum(result.milp_solve_count for result in all_results)),
         "milp_cache_hit_count": int(sum(result.milp_cache_hit_count for result in all_results)),
+        "local_search_trial_count": int(sum(result.local_search_trial_count for result in all_results)),
+        "local_search_full_eval_count": int(sum(result.local_search_full_eval_count for result in all_results)),
+        "local_search_patience": int(planning_cfg.get("local_search_patience", 8)),
+        "local_search_top_options": int(planning_cfg.get("local_search_top_options", 5)),
+        "local_search_max_full_evals": int(planning_cfg.get("local_search_max_full_evals", 200)),
         "slowest_candidate_duration_s": round(max((result.duration_s for result in all_results), default=0.0), 3),
     }
 

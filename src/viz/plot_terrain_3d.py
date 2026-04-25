@@ -28,7 +28,7 @@ def _cyan_red_colormap() -> LinearSegmentedColormap:
 
 @dataclass(slots=True)
 class TerrainSurfacePreview:
-    """Downsampled terrain surface prepared for 3D visualization."""
+    """Terrain surface prepared for 3D visualization."""
 
     x: np.ndarray
     y: np.ndarray
@@ -86,7 +86,7 @@ def generate_terrain_3d_previews(
     plots_dir = Path(output_dir)
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    max_grid_size = int(cfg.get("terrain_3d_max_grid_size", 200))
+    max_grid_size = _resolve_max_grid_size(cfg.get("terrain_3d_max_grid_size", 0))
     vertical_exaggeration = float(cfg.get("terrain_3d_vertical_exaggeration", 3.0))
     elev_deg = float(cfg.get("terrain_3d_camera_elev_deg", 40.0))
     azim_deg = float(cfg.get("terrain_3d_camera_azim_deg", -60.0))
@@ -137,18 +137,20 @@ def downsample_terrain_surface(
     *,
     dtm: np.ndarray,
     profile: dict[str, Any],
-    max_grid_size: int,
+    max_grid_size: int | None,
 ) -> TerrainSurfacePreview:
-    """Downsample a terrain raster into a manageable grid for 3D preview."""
+    """Prepare a terrain raster for 3D preview, optionally limiting grid size."""
 
     if dtm.ndim != 2:
         raise ValueError("DTM must be a 2D array for 3D preview.")
-    if max_grid_size < 2:
+    if max_grid_size is not None and max_grid_size <= 0:
+        max_grid_size = None
+    if max_grid_size is not None and max_grid_size < 2:
         raise ValueError("max_grid_size must be at least 2.")
 
     height, width = dtm.shape
-    sampled_height = min(height, max_grid_size)
-    sampled_width = min(width, max_grid_size)
+    sampled_height = height if max_grid_size is None else min(height, max_grid_size)
+    sampled_width = width if max_grid_size is None else min(width, max_grid_size)
 
     row_idx = np.unique(np.linspace(0, height - 1, sampled_height, dtype=int))
     col_idx = np.unique(np.linspace(0, width - 1, sampled_width, dtype=int))
@@ -168,6 +170,14 @@ def downsample_terrain_surface(
         original_height=height,
         original_width=width,
     )
+
+
+def _resolve_max_grid_size(value: Any) -> int | None:
+    """Resolve the configured 3D grid cap; 0/empty means use the original raster."""
+
+    if value in (None, "", 0, "0"):
+        return None
+    return int(value)
 
 
 def build_scene_3d_overlays(
@@ -392,8 +402,7 @@ def _save_matplotlib_surface(
 
     ax.set_title(
         "Terrain 3D Preview With Scene Overlays\n"
-        f"sampled {surface.sampled_width}x{surface.sampled_height} from "
-        f"{surface.original_width}x{surface.original_height}"
+        f"{_surface_resolution_label(surface)}"
     )
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
@@ -497,8 +506,7 @@ def _save_plotly_surface(
     fig.update_layout(
         title=(
             "Terrain 3D Preview With Scene Overlays"
-            f" (sampled {surface.sampled_width}x{surface.sampled_height} from "
-            f"{surface.original_width}x{surface.original_height})"
+            f" ({_surface_resolution_label(surface)})"
         ),
         scene={
             "xaxis_title": "X (m)",
@@ -512,6 +520,20 @@ def _save_plotly_surface(
         margin={"l": 0, "r": 0, "t": 80, "b": 0},
     )
     fig.write_html(output_path, include_plotlyjs="cdn")
+
+
+def _surface_resolution_label(surface: TerrainSurfacePreview) -> str:
+    """Return a short label describing whether the 3D surface was downsampled."""
+
+    if (
+        surface.sampled_width == surface.original_width
+        and surface.sampled_height == surface.original_height
+    ):
+        return f"full {surface.original_width}x{surface.original_height}"
+    return (
+        f"sampled {surface.sampled_width}x{surface.sampled_height} from "
+        f"{surface.original_width}x{surface.original_height}"
+    )
 
 
 def _build_line_overlays(

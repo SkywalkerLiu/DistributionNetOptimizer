@@ -49,12 +49,16 @@ def build_summary_v2(
         and line_violation_count == 0
         and pole_user_violation_count == 0
     )
+    emitted_reasons = [] if feasible else infeasible_reasons
 
     return {
         "algorithm": "planning_v2",
         "feasible": feasible,
-        "infeasible_reason": [] if feasible else infeasible_reasons,
+        "infeasible_reasons": emitted_reasons,
+        "infeasible_reason": emitted_reasons,
         "diagnostics": diagnostics,
+        "top_diagnostics": diagnostics[:5],
+        "violation_examples": _violation_examples(planned_lines=planned_lines, poles=poles),
         "objective": {
             "total": round(float(solution.objective), 3),
             "build_cost": round(float(solution.build_cost), 3),
@@ -143,6 +147,84 @@ def _point_user_violation_count(points: gpd.GeoDataFrame) -> int:
     required = points["required_user_clearance_m"].astype(float)
     applicable = clearance >= 0.0
     return int(((clearance + 1e-9 < required) & applicable).sum())
+
+
+def _violation_examples(
+    *,
+    planned_lines: gpd.GeoDataFrame,
+    poles: gpd.GeoDataFrame,
+    limit: int = 5,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return compact examples that help identify final geometry violations."""
+
+    return {
+        "line_vertical_clearance": _line_vertical_violation_examples(planned_lines, limit=limit),
+        "line_user_clearance": _line_user_violation_examples(planned_lines, limit=limit),
+        "pole_user_clearance": _pole_user_violation_examples(poles, limit=limit),
+    }
+
+
+def _line_vertical_violation_examples(planned_lines: gpd.GeoDataFrame, *, limit: int) -> list[dict[str, Any]]:
+    if planned_lines.empty or not {"line_id", "min_clearance_m", "required_clearance_m"}.issubset(planned_lines.columns):
+        return []
+    rows = planned_lines.loc[
+        planned_lines["min_clearance_m"].astype(float) + 1e-9
+        < planned_lines["required_clearance_m"].astype(float)
+    ].head(limit)
+    return [
+        {
+            "line_id": _json_scalar(row.line_id),
+            "line_type": str(getattr(row, "line_type", "")),
+            "min_clearance_m": round(float(row.min_clearance_m), 3),
+            "required_clearance_m": round(float(row.required_clearance_m), 3),
+        }
+        for row in rows.itertuples()
+    ]
+
+
+def _line_user_violation_examples(planned_lines: gpd.GeoDataFrame, *, limit: int) -> list[dict[str, Any]]:
+    required_columns = {"line_id", "user_clearance_m", "required_user_clearance_m"}
+    if planned_lines.empty or not required_columns.issubset(planned_lines.columns):
+        return []
+    clearance = planned_lines["user_clearance_m"].astype(float)
+    required = planned_lines["required_user_clearance_m"].astype(float)
+    rows = planned_lines.loc[((clearance + 1e-9 < required) & (clearance >= 0.0))].head(limit)
+    return [
+        {
+            "line_id": _json_scalar(row.line_id),
+            "line_type": str(getattr(row, "line_type", "")),
+            "user_clearance_m": round(float(row.user_clearance_m), 3),
+            "required_user_clearance_m": round(float(row.required_user_clearance_m), 3),
+        }
+        for row in rows.itertuples()
+    ]
+
+
+def _pole_user_violation_examples(poles: gpd.GeoDataFrame, *, limit: int) -> list[dict[str, Any]]:
+    required_columns = {"pole_id", "user_clearance_m", "required_user_clearance_m"}
+    if poles.empty or not required_columns.issubset(poles.columns):
+        return []
+    clearance = poles["user_clearance_m"].astype(float)
+    required = poles["required_user_clearance_m"].astype(float)
+    rows = poles.loc[((clearance + 1e-9 < required) & (clearance >= 0.0))].head(limit)
+    return [
+        {
+            "pole_id": str(row.pole_id),
+            "user_clearance_m": round(float(row.user_clearance_m), 3),
+            "required_user_clearance_m": round(float(row.required_user_clearance_m), 3),
+        }
+        for row in rows.itertuples()
+    ]
+
+
+def _json_scalar(value: Any) -> int | float | str:
+    """Convert pandas/numpy scalar values into JSON-friendly primitives."""
+
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, (int, float, str)):
+        return value
+    return str(value)
 
 
 def _dedupe_reasons(reasons: list[str]) -> list[str]:

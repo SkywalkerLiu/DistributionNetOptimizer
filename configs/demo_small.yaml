@@ -126,7 +126,7 @@ outputs:
   create_plots: true
 
 visualization:
-  terrain_3d_max_grid_size: 120
+  terrain_3d_max_grid_size: 0
   terrain_3d_vertical_exaggeration: 2.5
   terrain_3d_camera_elev_deg: 38
   terrain_3d_camera_azim_deg: -55

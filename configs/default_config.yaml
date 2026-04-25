@@ -1,10 +1,10 @@
 scene:
-  width_m: 1000
-  height_m: 1000
+  width_m: 500
+  height_m: 500
   max_elevation_m: 100
   resolution_m: 1
   origin_x_m: 0
-  origin_y_m: 1000
+  origin_y_m: 500
   crs: EPSG:3857
   seed: 98
 
@@ -92,8 +92,8 @@ planning:
 
 planning_v2:
   enable_v2_optimizer: true
-  tx_candidate_count: 150
-  tx_prefilter_top_k: 20
+  tx_candidate_count: 60
+  tx_prefilter_top_k: 6
   corridor_safe_margin_m: 12.0
   corridor_cluster_count: 6
   corridor_edge_max_length_m: 180.0
@@ -110,17 +110,21 @@ planning_v2:
   voltage_drop_max_pct: 7.0
   phase_balance_target_ratio: 0.10
   phase_balance_max_ratio: 0.15
-  milp_time_limit_s: 180
+  milp_time_limit_s: 8
   solver_backend: highs
-  mip_gap: 0.05
-  parallel_candidate_eval: true
-  parallel_workers: 0
+  mip_gap: 0.15
+  parallel_candidate_eval: false
+  parallel_workers: 1
   highs_threads_per_worker: 1
-  local_search_top_k: 8
+  local_search_top_k: 1
+  local_search_patience: 2
+  local_search_top_options: 1
+  local_search_max_full_evals: 8
   emit_performance_metrics: true
-  alns_max_iter: 500
+  alns_max_iter: 20
   alns_destroy_ratio: 0.15
-  candidate_solution_pool_size: 50
+  candidate_solution_pool_size: 6
+  final_geometry_check_top_k: 6
   show_progress: true
   progress_bar_width: 32
 
@@ -128,7 +132,7 @@ outputs:
   create_plots: true
 
 visualization:
-  terrain_3d_max_grid_size: 200
+  terrain_3d_max_grid_size: 0
   terrain_3d_vertical_exaggeration: 3.0
   terrain_3d_camera_elev_deg: 40
   terrain_3d_camera_azim_deg: -60
