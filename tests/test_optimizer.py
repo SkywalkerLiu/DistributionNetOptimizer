@@ -8,7 +8,10 @@ from shapely.geometry import Point
 from src.io.raster_io import build_raster_profile
 from src.planning.corridor_graph import build_corridor_graph
 from src.planning.geometry_constraints import segment_is_feasible
+from src.planning.models import PowerFlowResult
 from src.planning.optimizer import optimize_distribution_network
+from src.planning.optimizer_v2 import _resolve_parallel_workers
+from src.planning.voltage_eval import evaluate_solution_feasibility
 
 
 def test_corridor_graph_respects_forbidden_mask() -> None:
@@ -43,6 +46,7 @@ def test_corridor_graph_respects_forbidden_mask() -> None:
 
     assert corridor.nodes
     assert corridor.edges
+    user_union = users.geometry.union_all()
     for edge in corridor.edges.values():
         assert segment_is_feasible(
             edge.geometry.coords[0][0],
@@ -53,6 +57,9 @@ def test_corridor_graph_respects_forbidden_mask() -> None:
             profile=profile,
             sample_step_m=4.0,
         )
+        assert edge.geometry.distance(user_union) >= config["planning_v2"]["line_user_clearance_m"] - 1e-9
+    for node in corridor.nodes.values():
+        assert Point(float(node.x), float(node.y)).distance(user_union) >= config["planning_v2"]["pole_user_clearance_m"] - 1e-9
 
 
 def test_optimizer_outputs_v2_radial_plan() -> None:
@@ -86,6 +93,10 @@ def test_optimizer_outputs_v2_radial_plan() -> None:
     )
 
     assert optimized.summary["algorithm"] == "planning_v2"
+    assert optimized.summary["infeasible_reason"] == []
+    assert optimized.summary["performance"]["initial_candidate_count"] == config["planning_v2"]["tx_prefilter_top_k"]
+    assert optimized.summary["performance"]["local_search_candidate_count"] == config["planning_v2"]["local_search_top_k"]
+    assert optimized.summary["performance"]["milp_solve_count"] >= config["planning_v2"]["tx_prefilter_top_k"]
     assert len(optimized.transformer) == 1
     assert not optimized.poles.empty
     assert not optimized.planned_lines.empty
@@ -96,6 +107,8 @@ def test_optimizer_outputs_v2_radial_plan() -> None:
     assert optimized.users["connected_node_id"].astype(str).ne("").all()
 
     lv_lines = optimized.planned_lines.loc[optimized.planned_lines["line_type"] == "lv_line"]
+    assert (optimized.poles["user_clearance_m"] >= config["planning_v2"]["pole_user_clearance_m"] - 1e-9).all()
+    assert (lv_lines["user_clearance_m"] >= config["planning_v2"]["line_user_clearance_m"] - 1e-9).all()
     graph = nx.Graph()
     for row in lv_lines.itertuples():
         graph.add_edge(str(row.from_node), str(row.to_node))
@@ -170,6 +183,53 @@ def test_optimizer_progress_bar_writes_terminal_status(capsys) -> None:
     assert "优化进度 [" in captured.out
     assert "候选评估" in captured.out
     assert "完成" in captured.out
+
+
+def test_feasibility_reports_machine_readable_reason_codes() -> None:
+    power_flow = PowerFlowResult(
+        edge_phase_loads={},
+        edge_phase_kw={},
+        edge_losses_kw={},
+        edge_voltage_drop_pct={},
+        transformer_phase_loads=np.asarray([30.0, 0.0, 0.0], dtype=float),
+        user_voltage_drop_pct={1: 12.0},
+        user_service_drop_pct={1: 0.5},
+        user_connection_nodes={1: "n1"},
+        total_loss_kw=0.0,
+        max_voltage_drop_pct=12.0,
+    )
+
+    ok, diagnostics, reasons = evaluate_solution_feasibility(
+        users=gpd.GeoDataFrame(),
+        power_flow=power_flow,
+        planning_cfg={
+            "transformer_capacity_kva": 630.0,
+            "max_loading_ratio": 1.0,
+            "voltage_drop_max_pct": 7.0,
+            "phase_balance_max_ratio": 0.15,
+        },
+    )
+
+    assert not ok
+    assert diagnostics
+    assert "voltage_drop_exceeded" in reasons
+    assert "phase_unbalance_exceeded" in reasons
+
+
+def test_parallel_worker_auto_resolution(monkeypatch) -> None:
+    monkeypatch.setattr("src.planning.optimizer_v2.os.cpu_count", lambda: 8)
+    assert _resolve_parallel_workers(
+        planning_cfg={"parallel_candidate_eval": True, "parallel_workers": 0},
+        task_count=20,
+    ) == 6
+    assert _resolve_parallel_workers(
+        planning_cfg={"parallel_candidate_eval": True, "parallel_workers": 3},
+        task_count=20,
+    ) == 3
+    assert _resolve_parallel_workers(
+        planning_cfg={"parallel_candidate_eval": False, "parallel_workers": 0},
+        task_count=20,
+    ) == 1
 
 
 def _users(specs: list[tuple[int, float, float, float]]) -> gpd.GeoDataFrame:
@@ -249,10 +309,19 @@ def _config() -> dict:
             "segment_unbalance_weight": 0.5,
             "max_service_drop_m": 25.0,
             "max_pole_span_m": 50.0,
+            "pole_user_clearance_m": 5.0,
+            "line_user_clearance_m": 1.0,
             "voltage_drop_max_pct": 20.0,
             "phase_balance_target_ratio": 0.15,
             "phase_balance_max_ratio": 0.25,
-            "alns_max_iter": 4,
+            "solver_backend": "highs",
+            "mip_gap": 0.05,
+            "parallel_candidate_eval": True,
+            "parallel_workers": 1,
+            "highs_threads_per_worker": 1,
+            "local_search_top_k": 1,
+            "emit_performance_metrics": True,
+            "alns_max_iter": 1,
             "alns_destroy_ratio": 0.2,
             "candidate_solution_pool_size": 4,
             "show_progress": False,

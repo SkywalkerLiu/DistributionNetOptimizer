@@ -10,7 +10,12 @@ from scipy.spatial import cKDTree
 from shapely.geometry import LineString
 
 from src.planning.common import cell_to_xy, nearest_passable_cell, point_metrics, xy_to_cell
-from src.planning.geometry_constraints import segment_is_feasible
+from src.planning.geometry_constraints import (
+    build_user_point_map,
+    line_min_user_clearance,
+    point_min_user_clearance,
+    segment_is_feasible,
+)
 from src.planning.models import CorridorEdge, CorridorGraph, CorridorNode
 
 
@@ -37,6 +42,18 @@ def build_corridor_graph(
         corridor_mask = base_passable > 0
     if not corridor_mask.any():
         raise ValueError("No feasible corridor cells are available for the V2 optimizer.")
+
+    user_points = build_user_point_map(users)
+    pole_user_clearance_m = float(planning_cfg.get("pole_user_clearance_m", 5.0))
+    line_user_clearance_m = float(planning_cfg.get("line_user_clearance_m", 1.0))
+    support_mask = _support_mask_outside_users(
+        corridor_mask=corridor_mask,
+        profile=profile,
+        users=users,
+        min_clearance_m=pole_user_clearance_m,
+    )
+    if not support_mask.any():
+        raise ValueError("No feasible pole support cells remain outside the configured user clearance.")
 
     boundary_distance_m = ndimage.distance_transform_edt(corridor_mask) * resolution
     graph = nx.Graph()
@@ -72,7 +89,7 @@ def build_corridor_graph(
     stride = max(1, int(round((edge_max_length_m / 2.0) / resolution)))
     for row in range(0, corridor_mask.shape[0], stride):
         for col in range(0, corridor_mask.shape[1], stride):
-            nearest = nearest_passable_cell(corridor_mask, row=row, col=col, search_radius=max(1, stride))
+            nearest = nearest_passable_cell(support_mask, row=row, col=col, search_radius=max(1, stride))
             if nearest is None:
                 continue
             add_node(row=nearest[0], col=nearest[1], kind="junction", prefix="j")
@@ -85,14 +102,14 @@ def build_corridor_graph(
     )
     for center_x, center_y in cluster_centers:
         row, col = xy_to_cell(profile, float(center_x), float(center_y), shape=corridor_mask.shape)
-        nearest = nearest_passable_cell(corridor_mask, row=row, col=col, search_radius=max(2, stride * 2))
+        nearest = nearest_passable_cell(support_mask, row=row, col=col, search_radius=max(2, stride * 2))
         if nearest is not None:
             add_node(row=nearest[0], col=nearest[1], kind="cluster", prefix="c")
 
     for row in users.itertuples():
         rr, cc = xy_to_cell(profile, float(row.geometry.x), float(row.geometry.y), shape=corridor_mask.shape)
         nearest = nearest_passable_cell(
-            corridor_mask,
+            support_mask,
             row=rr,
             col=cc,
             search_radius=max(2, int(math.ceil(float(planning_cfg.get("max_service_drop_m", 25.0)) / resolution))),
@@ -101,6 +118,8 @@ def build_corridor_graph(
             add_node(row=nearest[0], col=nearest[1], kind="attach", prefix="a")
 
     node_ids = list(nodes)
+    if not node_ids:
+        raise ValueError("No feasible corridor graph nodes remain outside the configured user clearance.")
     node_xy = np.asarray([(nodes[node_id].x, nodes[node_id].y) for node_id in node_ids], dtype=float)
     tree = cKDTree(node_xy)
     allowed_mask = corridor_mask.astype(np.uint8)
@@ -134,6 +153,8 @@ def build_corridor_graph(
                 profile=profile,
                 planning_cfg=planning_cfg,
                 sample_step_m=sample_step_m,
+                user_points=user_points,
+                line_user_clearance_m=line_user_clearance_m,
             )
 
     _bridge_components(
@@ -146,6 +167,8 @@ def build_corridor_graph(
         profile=profile,
         planning_cfg=planning_cfg,
         sample_step_m=sample_step_m,
+        user_points=user_points,
+        line_user_clearance_m=line_user_clearance_m,
     )
 
     edge_ids: dict[tuple[str, str], str] = {}
@@ -196,6 +219,8 @@ def _try_add_edge(
     profile: dict[str, Any],
     planning_cfg: dict[str, Any],
     sample_step_m: float,
+    user_points: dict[int, Any] | None = None,
+    line_user_clearance_m: float = 1.0,
 ) -> bool:
     """Add one feasible corridor edge to the graph when possible."""
 
@@ -218,6 +243,13 @@ def _try_add_edge(
         sample_step_m=sample_step_m,
     ):
         return False
+    if user_points and line_user_clearance_m > 0.0:
+        clearance = line_min_user_clearance(
+            line=LineString([(node_u.x, node_u.y), (node_v.x, node_v.y)]),
+            user_points=user_points,
+        )
+        if clearance + 1e-9 < line_user_clearance_m:
+            return False
 
     terrain_cost = _terrain_cost(node_u=node_u, node_v=node_v, slope=slope, roughness=roughness)
     boundary_clearance = min(
@@ -254,6 +286,8 @@ def _bridge_components(
     profile: dict[str, Any],
     planning_cfg: dict[str, Any],
     sample_step_m: float,
+    user_points: dict[int, Any] | None = None,
+    line_user_clearance_m: float = 1.0,
 ) -> None:
     """Bridge disconnected corridor components with the shortest feasible links."""
 
@@ -278,6 +312,13 @@ def _bridge_components(
                             sample_step_m=sample_step_m,
                         ):
                             continue
+                        if user_points and line_user_clearance_m > 0.0:
+                            clearance = line_min_user_clearance(
+                                line=LineString([(nodes[left].x, nodes[left].y), (nodes[right].x, nodes[right].y)]),
+                                user_points=user_points,
+                            )
+                            if clearance + 1e-9 < line_user_clearance_m:
+                                continue
                         best_distance = distance
                         best_pair = (left, right)
         if best_pair is None:
@@ -296,6 +337,8 @@ def _bridge_components(
             profile=profile,
             planning_cfg=planning_cfg,
             sample_step_m=sample_step_m,
+            user_points=user_points,
+            line_user_clearance_m=line_user_clearance_m,
         )
 
 
@@ -311,6 +354,39 @@ def _terrain_cost(
     avg_slope = float(slope[node_u.row, node_u.col] + slope[node_v.row, node_v.col]) / 2.0
     avg_roughness = float(roughness[node_u.row, node_u.col] + roughness[node_v.row, node_v.col]) / 2.0
     return avg_slope * 2.0 + avg_roughness * 1.5
+
+
+def _support_mask_outside_users(
+    *,
+    corridor_mask: np.ndarray,
+    profile: dict[str, Any],
+    users: Any,
+    min_clearance_m: float,
+) -> np.ndarray:
+    """Return corridor cells whose centers satisfy the user-to-pole clearance."""
+
+    support_mask = corridor_mask.astype(bool, copy=True)
+    if min_clearance_m <= 0.0 or users is None or len(users) == 0:
+        return support_mask
+
+    rows, cols = np.nonzero(support_mask)
+    if len(rows) == 0:
+        return support_mask
+    cell_xy = np.asarray([cell_to_xy(profile, int(row), int(col)) for row, col in zip(rows, cols)], dtype=float)
+    user_xy = np.column_stack([users.geometry.x.to_numpy(dtype=float), users.geometry.y.to_numpy(dtype=float)])
+    distances, _ = cKDTree(user_xy).query(cell_xy, k=1)
+    keep = np.asarray(distances, dtype=float) + 1e-9 >= min_clearance_m
+    filtered = np.zeros_like(support_mask, dtype=bool)
+    filtered[rows[keep], cols[keep]] = True
+
+    # A raster cell-center mask can be slightly conservative near boundaries.
+    # If it removes every cell, keep exact point checks in add_node as a guard.
+    if not filtered.any():
+        for row, col in zip(rows, cols):
+            x, y = cell_to_xy(profile, int(row), int(col))
+            if point_min_user_clearance(x=x, y=y, user_points=build_user_point_map(users)) + 1e-9 >= min_clearance_m:
+                filtered[int(row), int(col)] = True
+    return filtered
 
 
 def _kmeans_centers(*, points: np.ndarray, count: int, seed: int) -> np.ndarray:

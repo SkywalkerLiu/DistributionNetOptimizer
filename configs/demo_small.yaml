@@ -103,10 +103,19 @@ planning_v2:
   segment_unbalance_weight: 1.0
   max_service_drop_m: 25.0
   max_pole_span_m: 50.0
+  pole_user_clearance_m: 5.0
+  line_user_clearance_m: 1.0
   voltage_drop_max_pct: 7.0
   phase_balance_target_ratio: 0.10
   phase_balance_max_ratio: 0.15
   milp_time_limit_s: 60
+  solver_backend: highs
+  mip_gap: 0.05
+  parallel_candidate_eval: true
+  parallel_workers: 0
+  highs_threads_per_worker: 1
+  local_search_top_k: 4
+  emit_performance_metrics: true
   alns_max_iter: 12
   alns_destroy_ratio: 0.15
   candidate_solution_pool_size: 6

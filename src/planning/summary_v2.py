@@ -29,13 +29,31 @@ def build_summary_v2(
             continue
         shared_unbalance.append(phase_unbalance_ratio(load))
     diagnostics = list(solution.diagnostics)
-    violation_count = int(planned_lines["is_violation"].sum()) if not planned_lines.empty else 0
-    if violation_count:
-        diagnostics.append(f"{violation_count} line spans violate configured clearance limits.")
+    infeasible_reasons = _dedupe_reasons(list(solution.infeasible_reasons))
+    line_violation_count = int(planned_lines["is_violation"].sum()) if not planned_lines.empty else 0
+    line_vertical_violation_count = _line_vertical_violation_count(planned_lines)
+    line_user_violation_count = _line_user_violation_count(planned_lines)
+    pole_user_violation_count = _point_user_violation_count(poles)
+    if line_vertical_violation_count:
+        diagnostics.append(f"{line_vertical_violation_count} line spans violate configured vertical clearance limits.")
+        infeasible_reasons.append("line_vertical_clearance_exceeded")
+    if line_user_violation_count:
+        diagnostics.append(f"{line_user_violation_count} line spans violate configured user horizontal clearance limits.")
+        infeasible_reasons.append("line_user_clearance_exceeded")
+    if pole_user_violation_count:
+        diagnostics.append(f"{pole_user_violation_count} poles violate configured user horizontal clearance limits.")
+        infeasible_reasons.append("pole_user_clearance_exceeded")
+    infeasible_reasons = _dedupe_reasons(infeasible_reasons)
+    feasible = bool(
+        solution.feasible
+        and line_violation_count == 0
+        and pole_user_violation_count == 0
+    )
 
     return {
         "algorithm": "planning_v2",
-        "feasible": bool(solution.feasible and violation_count == 0),
+        "feasible": feasible,
+        "infeasible_reason": [] if feasible else infeasible_reasons,
         "diagnostics": diagnostics,
         "objective": {
             "total": round(float(solution.objective), 3),
@@ -68,9 +86,14 @@ def build_summary_v2(
                 float(planned_lines["horizontal_length_m"].sum()) if not planned_lines.empty else 0.0,
                 3,
             ),
-            "violation_count": violation_count,
+            "violation_count": line_violation_count,
+            "vertical_clearance_violation_count": line_vertical_violation_count,
+            "user_clearance_violation_count": line_user_violation_count,
         },
-        "poles": {"count": int(len(poles))},
+        "poles": {
+            "count": int(len(poles)),
+            "user_clearance_violation_count": pole_user_violation_count,
+        },
         "phase_balance": {
             "load_a_kva": round(float(phase_load[0]), 3),
             "load_b_kva": round(float(phase_load[1]), 3),
@@ -91,3 +114,45 @@ def build_summary_v2(
         },
     }
 
+
+def _line_vertical_violation_count(planned_lines: gpd.GeoDataFrame) -> int:
+    """Count line spans whose vertical clearance is below the configured requirement."""
+
+    if planned_lines.empty or "min_clearance_m" not in planned_lines.columns:
+        return 0
+    return int((planned_lines["min_clearance_m"] + 1e-9 < planned_lines["required_clearance_m"]).sum())
+
+
+def _line_user_violation_count(planned_lines: gpd.GeoDataFrame) -> int:
+    """Count line spans whose horizontal clearance to users is below the configured requirement."""
+
+    if planned_lines.empty or "user_clearance_m" not in planned_lines.columns:
+        return 0
+    clearance = planned_lines["user_clearance_m"].astype(float)
+    required = planned_lines["required_user_clearance_m"].astype(float)
+    applicable = clearance >= 0.0
+    return int(((clearance + 1e-9 < required) & applicable).sum())
+
+
+def _point_user_violation_count(points: gpd.GeoDataFrame) -> int:
+    """Count poles/point assets whose horizontal clearance to users is too small."""
+
+    if points.empty or "user_clearance_m" not in points.columns:
+        return 0
+    clearance = points["user_clearance_m"].astype(float)
+    required = points["required_user_clearance_m"].astype(float)
+    applicable = clearance >= 0.0
+    return int(((clearance + 1e-9 < required) & applicable).sum())
+
+
+def _dedupe_reasons(reasons: list[str]) -> list[str]:
+    """Return reason codes once while preserving their original order."""
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for reason in reasons:
+        if not reason or reason in seen:
+            continue
+        seen.add(reason)
+        ordered.append(reason)
+    return ordered

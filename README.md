@@ -28,7 +28,7 @@ src/planning/
   corridor_graph.py          # 候选走廊图构建
   transformer_candidates.py  # 配变候选预筛
   attachment_model.py        # 用户接入候选
-  radial_tree_milp.py        # 径向树选边近似求解
+  radial_tree_milp.py        # Pyomo + HiGHS 径向树 MILP 求解
   phase_assignment.py        # 三相分配优化
   bfs_power_flow.py          # 径向潮流与压降评估
   loss_eval.py               # 线损成本折算
@@ -51,6 +51,8 @@ src/planning/
 ```bash
 python -m pip install -r requirements.txt
 ```
+
+默认优化求解器为开源组合 `pyomo` + `highspy`。项目当前只接入推荐的 HiGHS 后端，不包含 OR-Tools、Gurobi 或 SCIP 后端。
 
 ## 常用命令
 
@@ -102,13 +104,89 @@ python -m src.main plot-plan --config configs/default_config.yaml
 - `corridor_edge_max_length_m`：候选走廊边最大长度
 - `build_cost_weight` / `loss_cost_weight` / `phase_unbalance_weight`：目标函数权重
 - `max_service_drop_m` / `max_pole_span_m` / `voltage_drop_max_pct`：硬约束
+- `pole_user_clearance_m`：杆塔/配变候选点到用户点的最小水平净距，默认 `5.0m`
+- `line_user_clearance_m`：公共低压线路到用户点的最小水平净距，默认 `1.0m`；接户线允许连接自己的用户点，但仍会避让其他用户点
+- `solver_backend`：当前仅支持 `highs`
+- `milp_time_limit_s` / `mip_gap`：HiGHS 求解时间限制与 MIP gap
+- `parallel_candidate_eval`：是否并行评估配变候选，默认 `true`
+- `parallel_workers`：候选评估进程数，`0` 表示自动使用 `min(候选数, CPU核心数 - 2)`
+- `highs_threads_per_worker`：每个 worker 内 HiGHS 使用的线程数，默认 `1`
+- `local_search_top_k`：只对初始评估排名前 K 的候选做局部重挂接，默认 `8`
+- `emit_performance_metrics`：是否在 summary 中输出性能指标，默认 `true`
 - `alns_max_iter` / `alns_destroy_ratio`：局部重挂接改进参数
 - `show_progress`：是否显示终端进度条
 - `progress_bar_width`：进度条宽度
 
+## 性能优化与运行时间调优
+
+V2 优化的主要耗时来自多次构建 Pyomo 模型并调用 HiGHS 求解径向树 MILP。Pyomo 建模和单个 HiGHS 求解通常不会让整机 CPU 长时间满载，所以看到 CPU 总占用低于 `20%` 不一定代表程序卡死；更常见的原因是候选配变串行评估和重复 MILP 调用。
+
+当前默认采用“质量优先”的两阶段搜索：
+
+1. 并行评估全部初始配变候选。
+2. 按初始目标值排序，只对前 `local_search_top_k` 个候选做局部重挂接。
+3. 最终从全部初始解和 top-k 改进解中选最优解。
+
+推荐配置如下：
+
+```yaml
+planning_v2:
+  parallel_candidate_eval: true
+  parallel_workers: 0
+  highs_threads_per_worker: 1
+  local_search_top_k: 8
+  emit_performance_metrics: true
+```
+
+调参建议：
+
+- 质量优先：保持 `tx_prefilter_top_k: 20`、`mip_gap: 0.05`，优先使用并行和 `local_search_top_k: 8`。
+- 更快出图：降低 `local_search_top_k` 或 `alns_max_iter`，例如 `local_search_top_k: 4`、`alns_max_iter: 100`。
+- 调试复现：设置 `parallel_workers: 1` 或 `parallel_candidate_eval: false`，让候选评估串行执行。
+- 多进程受限环境：如果 Windows sandbox 或权限策略禁止创建进程池，程序会自动回退串行，并在 summary 的 `performance.parallel_fallback_reason` 中记录原因。
+
+执行完成后，可在 `data/outputs/plans/optimization_summary.json` 的 `performance` 字段查看阶段耗时和 MILP 调用次数，例如：
+
+```json
+{
+  "performance": {
+    "total_duration_s": 412.8,
+    "corridor_build_duration_s": 8.2,
+    "initial_candidate_eval_duration_s": 146.5,
+    "local_search_duration_s": 231.4,
+    "worker_count": 6,
+    "milp_solve_count": 96,
+    "milp_cache_hit_count": 12,
+    "slowest_candidate_duration_s": 52.3
+  }
+}
+```
+
+优化 summary 会输出稳定的不可行原因代码，例如：
+
+```yaml
+infeasible_reason:
+  - voltage_drop_exceeded
+  - service_drop_too_long
+  - no_corridor_to_user_17
+  - phase_unbalance_exceeded
+```
+
+当前已覆盖的主要 reason code 包括：
+
+- `voltage_drop_exceeded`
+- `service_drop_too_long`
+- `phase_unbalance_exceeded`
+- `transformer_overloaded`
+- `line_vertical_clearance_exceeded`
+- `line_user_clearance_exceeded`
+- `pole_user_clearance_exceeded`
+- `radial_tree_infeasible`
+- `no_corridor_to_user_<user_id>`
+
 ## 输出图层
 
-标准 `GeoPackage` 图层 schema 仍由 [src/io/vector_io.py](/C:/Users/LHY/Desktop/MyProject_test/DistributionNetOptimizer/src/io/vector_io.py:1) 维护，核心图层包括：
+标准 `GeoPackage` 图层 schema 仍由 [src/io/vector_io.py](src/io/vector_io.py) 维护，核心图层包括：
 
 - `users`
 - `candidate_transformer`
@@ -122,6 +200,8 @@ python -m src.main plot-plan --config configs/default_config.yaml
 - `load_a_kva / load_b_kva / load_c_kva`
 - `voltage_drop_pct`
 - `min_clearance_m / required_clearance_m`
+- `user_clearance_m / required_user_clearance_m`
+- `violation_reason`
 - `is_violation`
 
 ## 测试
@@ -135,13 +215,16 @@ python -m pytest -q
 当前重点覆盖：
 
 - 走廊图不穿越禁区
+- 杆塔水平避让用户 `5m`，公共线路水平避让用户 `1m`
 - V2 优化输出保持径向树结构
 - 用户接户线长度约束
 - 相别分配、线损与压降指标输出
+- 不可行 reason code 输出
+- 两阶段候选评估、性能指标和并行 worker 配置
 - 终端进度条输出
 
 ## 说明
 
 - 当前优化器是规划级近似求解器，不是施工设计级详设工具
-- `radial_tree_milp.py` 现阶段使用的是不依赖外部 MILP 求解器的近似树选边方法，但接口与模块职责已经按 V2 结构拆开，后续可以在不改主流程的前提下替换为更精确的求解器
-- 详细设计思路见 [PLAN_opt_V2.md](/C:/Users/LHY/Desktop/MyProject_test/DistributionNetOptimizer/PLAN_opt_V2.md:1)
+- `radial_tree_milp.py` 使用 Pyomo 建模并调用 HiGHS 求解径向树选边 MILP；当前项目只维护这一推荐开源求解器后端
+- 详细设计思路见 [PLAN_opt_V2.md](PLAN_opt_V2.md)

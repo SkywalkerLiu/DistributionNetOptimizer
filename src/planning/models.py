@@ -89,6 +89,8 @@ class AttachmentOption:
     horizontal_length_m: float
     length_3d_m: float
     cost: float
+    feasible: bool = True
+    infeasible_reasons: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -134,4 +136,4 @@ class EvaluatedSolution:
     feasible: bool
     voltage_ok: bool
     diagnostics: list[str] = field(default_factory=list)
-
+    infeasible_reasons: list[str] = field(default_factory=list)

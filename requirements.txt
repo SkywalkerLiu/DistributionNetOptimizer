@@ -8,4 +8,6 @@ matplotlib
 plotly
 pyyaml
 networkx
+pyomo
+highspy
 pytest

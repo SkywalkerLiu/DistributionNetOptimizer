@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
+from shapely.geometry import LineString, Point
 
 from src.planning.common import sample_array, xy_to_cell
 
@@ -55,3 +56,62 @@ def segment_min_clearance(
         min_clearance = min(min_clearance, float(line_z - terrain_z))
     return float(min_clearance)
 
+
+def build_user_point_map(users: Any) -> dict[int, Point]:
+    """Return user geometries keyed by user id for horizontal clearance checks."""
+
+    user_points: dict[int, Point] = {}
+    if users is None:
+        return user_points
+    for row in users.itertuples():
+        geometry = getattr(row, "geometry", None)
+        if geometry is None or geometry.is_empty:
+            continue
+        user_points[int(row.user_id)] = Point(float(geometry.x), float(geometry.y))
+    return user_points
+
+
+def point_min_user_clearance(
+    *,
+    x: float,
+    y: float,
+    user_points: Mapping[int, Point],
+    exclude_user_id: int | None = None,
+) -> float:
+    """Return the minimum horizontal distance from a point to user points."""
+
+    if not user_points:
+        return float("inf")
+    point = Point(float(x), float(y))
+    distances = [
+        float(point.distance(user_point))
+        for user_id, user_point in user_points.items()
+        if exclude_user_id is None or int(user_id) != int(exclude_user_id)
+    ]
+    return min(distances, default=float("inf"))
+
+
+def line_min_user_clearance(
+    *,
+    line: LineString,
+    user_points: Mapping[int, Point],
+    exclude_user_id: int | None = None,
+) -> float:
+    """Return the minimum horizontal distance from a line to user points."""
+
+    if not user_points:
+        return float("inf")
+    distances = [
+        float(line.distance(user_point))
+        for user_id, user_point in user_points.items()
+        if exclude_user_id is None or int(user_id) != int(exclude_user_id)
+    ]
+    return min(distances, default=float("inf"))
+
+
+def finite_clearance_value(value: float) -> float:
+    """Convert an infinite clearance to a stable output value."""
+
+    if math.isfinite(float(value)):
+        return float(value)
+    return -1.0

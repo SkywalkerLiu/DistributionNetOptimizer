@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
 import math
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Any
 
 import geopandas as gpd
@@ -16,10 +20,24 @@ from src.planning.neighborhood_search import improve_attachment_choices
 from src.planning.phase_assignment import optimize_phase_assignment
 from src.planning.pole_generation import generate_plan_layers
 from src.planning.progress import OptimizationProgress
-from src.planning.radial_tree_milp import solve_radial_tree
+from src.planning.radial_tree_milp import RadialTreeModelData, build_radial_tree_model_data, solve_radial_tree
 from src.planning.summary_v2 import build_summary_v2
 from src.planning.transformer_candidates import generate_transformer_candidates
 from src.planning.voltage_eval import evaluate_solution_feasibility, phase_unbalance_penalty
+
+
+@dataclass(slots=True)
+class CandidateEvaluationResult:
+    """One evaluated transformer candidate plus lightweight performance data."""
+
+    candidate_index: int
+    solution: EvaluatedSolution
+    duration_s: float
+    milp_solve_count: int
+    milp_cache_hit_count: int
+
+
+_WORKER_CONTEXT: dict[str, Any] = {}
 
 
 def optimize_distribution_network_v2(
@@ -35,6 +53,7 @@ def optimize_distribution_network_v2(
 ) -> OptimizedPlan:
     """Run the V2 corridor-graph radial planning optimizer."""
 
+    total_started_at = time.perf_counter()
     planning_cfg = _resolve_planning_v2_config(config)
     users = _normalize_users(users=users, dtm=dtm, profile=profile)
     progress = OptimizationProgress(
@@ -51,6 +70,7 @@ def optimize_distribution_network_v2(
         label="准备输入",
         detail=f"用户 {len(users)} | 栅格 {dtm.shape[1]}x{dtm.shape[0]}",
     )
+    corridor_started_at = time.perf_counter()
     corridor = build_corridor_graph(
         dtm=dtm,
         slope=slope,
@@ -62,11 +82,13 @@ def optimize_distribution_network_v2(
         planning_cfg=planning_cfg,
         seed=int(config.get("scene", {}).get("seed", 0)),
     )
+    corridor_duration_s = time.perf_counter() - corridor_started_at
     progress.stage(
         progress=0.15,
         label="构建候选走廊图",
         detail=f"节点 {len(corridor.nodes)} | 边 {len(corridor.edges)}",
     )
+    prefilter_started_at = time.perf_counter()
     transformer_candidates = generate_transformer_candidates(
         corridor=corridor,
         users=users,
@@ -86,6 +108,7 @@ def optimize_distribution_network_v2(
         profile=profile,
     )
     base_choices = select_initial_attachments(attachment_options)
+    prefilter_duration_s = time.perf_counter() - prefilter_started_at
     progress.stage(
         progress=0.25,
         label="构建接入候选",
@@ -94,52 +117,45 @@ def optimize_distribution_network_v2(
 
     candidate_pool = transformer_candidates[: max(1, int(planning_cfg.get("candidate_solution_pool_size", 10)))]
     progress.total_candidates = max(1, len(candidate_pool))
-    solutions: list[EvaluatedSolution] = []
-    for candidate_index, candidate in enumerate(candidate_pool, start=1):
-        progress.candidate_started(
-            index=candidate_index,
-            total=len(candidate_pool),
-            detail=f"rank={candidate.rank}",
-        )
+    worker_count = _resolve_parallel_workers(
+        planning_cfg=planning_cfg,
+        task_count=len(candidate_pool),
+    )
+    radial_model_data = build_radial_tree_model_data(corridor)
 
-        def evaluate(choices: dict[int, Any]) -> EvaluatedSolution:
-            return _evaluate_candidate_solution(
-                candidate=candidate,
-                choices=choices,
-                corridor=corridor,
-                users=users,
-                planning_cfg=planning_cfg,
-            )
+    initial_started_at = time.perf_counter()
+    initial_results = _evaluate_initial_candidates(
+        candidate_pool=candidate_pool,
+        base_choices=base_choices,
+        corridor=corridor,
+        users=users,
+        planning_cfg=planning_cfg,
+        radial_model_data=radial_model_data,
+        worker_count=worker_count,
+        progress=progress,
+    )
+    initial_duration_s = time.perf_counter() - initial_started_at
+    initial_results.sort(key=lambda item: item.candidate_index)
 
-        initial = evaluate(base_choices)
-        progress.candidate_initial(
-            index=candidate_index,
-            total=len(candidate_pool),
-            objective=initial.objective,
-            feasible=initial.feasible,
-        )
-        improved = improve_attachment_choices(
-            options_by_user=attachment_options,
-            initial_solution=initial,
-            evaluate=evaluate,
-            max_iter=int(planning_cfg.get("alns_max_iter", 40)),
-            destroy_ratio=float(planning_cfg.get("alns_destroy_ratio", 0.15)),
-            progress_callback=lambda iteration, max_iter, changed, current_best: progress.candidate_iteration(
-                index=candidate_index,
-                total=len(candidate_pool),
-                iteration=iteration,
-                max_iter=max_iter,
-                objective=current_best.objective,
-                improved=changed,
-            ),
-        )
-        progress.candidate_finished(
-            index=candidate_index,
-            total=len(candidate_pool),
-            objective=improved.objective,
-            feasible=improved.feasible,
-        )
-        solutions.append(improved)
+    local_search_top_k = max(0, min(int(planning_cfg.get("local_search_top_k", 8)), len(initial_results)))
+    ranked_for_search = sorted(initial_results, key=lambda item: (not item.solution.feasible, item.solution.objective))[
+        :local_search_top_k
+    ]
+    search_started_at = time.perf_counter()
+    improved_results = _improve_top_candidates(
+        initial_results=ranked_for_search,
+        attachment_options=attachment_options,
+        corridor=corridor,
+        users=users,
+        planning_cfg=planning_cfg,
+        radial_model_data=radial_model_data,
+        worker_count=worker_count,
+        progress=progress,
+    )
+    local_search_duration_s = time.perf_counter() - search_started_at
+
+    solutions: list[EvaluatedSolution] = [result.solution for result in initial_results]
+    solutions.extend(result.solution for result in improved_results)
 
     if not solutions:
         raise ValueError("The V2 optimizer could not generate any candidate solutions.")
@@ -151,6 +167,7 @@ def optimize_distribution_network_v2(
         label="生成输出图层",
         detail="杆塔、线路和 summary 落图中",
     )
+    output_started_at = time.perf_counter()
     transformer_layer, poles_layer, planned_lines, user_connection_public = generate_plan_layers(
         corridor=corridor,
         solution=best,
@@ -166,6 +183,7 @@ def optimize_distribution_network_v2(
     users["voltage_drop_pct"] = users["user_id"].map(
         lambda value: best.power_flow.user_voltage_drop_pct.get(int(value), 0.0)
     )
+    output_duration_s = time.perf_counter() - output_started_at
     summary = build_summary_v2(
         corridor=corridor,
         solution=best,
@@ -174,8 +192,22 @@ def optimize_distribution_network_v2(
         planned_lines=planned_lines,
         planning_cfg=planning_cfg,
     )
+    if bool(planning_cfg.get("emit_performance_metrics", True)):
+        summary["performance"] = _build_performance_summary(
+            total_duration_s=time.perf_counter() - total_started_at,
+            corridor_duration_s=corridor_duration_s,
+            prefilter_duration_s=prefilter_duration_s,
+            initial_duration_s=initial_duration_s,
+            local_search_duration_s=local_search_duration_s,
+            output_duration_s=output_duration_s,
+            worker_count=worker_count,
+            initial_results=initial_results,
+            improved_results=improved_results,
+            local_search_top_k=local_search_top_k,
+            planning_cfg=planning_cfg,
+        )
     progress.finish(
-        detail=f"最优 obj={best.objective:.1f} | {'feasible' if best.feasible else 'infeasible'}",
+        detail=f"最优 obj={best.objective:.1f} | {'feasible' if summary['feasible'] else 'infeasible'}",
     )
     return OptimizedPlan(
         users=users,
@@ -186,6 +218,289 @@ def optimize_distribution_network_v2(
     )
 
 
+def _evaluate_initial_candidates(
+    *,
+    candidate_pool: list[Any],
+    base_choices: dict[int, Any],
+    corridor: Any,
+    users: gpd.GeoDataFrame,
+    planning_cfg: dict[str, Any],
+    radial_model_data: RadialTreeModelData,
+    worker_count: int,
+    progress: OptimizationProgress,
+) -> list[CandidateEvaluationResult]:
+    """Evaluate every initial transformer candidate, in parallel when configured."""
+
+    total = len(candidate_pool)
+    if _use_parallel(planning_cfg=planning_cfg, worker_count=worker_count):
+        context = {
+            "corridor": corridor,
+            "users": users,
+            "planning_cfg": planning_cfg,
+            "radial_model_data": radial_model_data,
+            "base_choices": base_choices,
+        }
+        try:
+            results: list[CandidateEvaluationResult] = []
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                initializer=_init_evaluation_worker,
+                initargs=(context,),
+            ) as executor:
+                futures = {
+                    executor.submit(_evaluate_initial_candidate_worker, index, candidate): index
+                    for index, candidate in enumerate(candidate_pool, start=1)
+                }
+                for completed, future in enumerate(as_completed(futures), start=1):
+                    result = future.result()
+                    results.append(result)
+                    progress.stage(
+                        progress=0.25 + 0.35 * completed / max(total, 1),
+                        label="候选评估",
+                        detail=(
+                            f"初始候选并行评估 {completed}/{total} | workers={worker_count} | "
+                            f"rank={result.solution.transformer_candidate.rank} | obj={result.solution.objective:.1f}"
+                        ),
+                    )
+            return results
+        except (OSError, PermissionError, RuntimeError) as exc:
+            planning_cfg["parallel_fallback_reason"] = f"{type(exc).__name__}: {exc}"
+            progress.stage(
+                progress=0.25,
+                label="候选评估",
+                detail="并行评估不可用，已自动回退串行",
+            )
+
+    results: list[CandidateEvaluationResult] = []
+    for index, candidate in enumerate(candidate_pool, start=1):
+        progress.candidate_started(index=index, total=total, detail=f"rank={candidate.rank}")
+        result = _evaluate_initial_candidate_direct(
+            candidate_index=index,
+            candidate=candidate,
+            base_choices=base_choices,
+            corridor=corridor,
+            users=users,
+            planning_cfg=planning_cfg,
+            radial_model_data=radial_model_data,
+        )
+        progress.candidate_initial(
+            index=index,
+            total=total,
+            objective=result.solution.objective,
+            feasible=result.solution.feasible,
+        )
+        results.append(result)
+    return results
+
+
+def _improve_top_candidates(
+    *,
+    initial_results: list[CandidateEvaluationResult],
+    attachment_options: dict[int, list[Any]],
+    corridor: Any,
+    users: gpd.GeoDataFrame,
+    planning_cfg: dict[str, Any],
+    radial_model_data: RadialTreeModelData,
+    worker_count: int,
+    progress: OptimizationProgress,
+) -> list[CandidateEvaluationResult]:
+    """Run local reattachment search for the ranked top-k candidates."""
+
+    if not initial_results:
+        return []
+
+    total = len(initial_results)
+    if _use_parallel(planning_cfg=planning_cfg, worker_count=worker_count) and total > 1:
+        context = {
+            "corridor": corridor,
+            "users": users,
+            "planning_cfg": planning_cfg,
+            "radial_model_data": radial_model_data,
+            "attachment_options": attachment_options,
+        }
+        try:
+            results: list[CandidateEvaluationResult] = []
+            with ProcessPoolExecutor(
+                max_workers=min(worker_count, total),
+                initializer=_init_evaluation_worker,
+                initargs=(context,),
+            ) as executor:
+                futures = {
+                    executor.submit(_improve_candidate_worker, result): result.candidate_index
+                    for result in initial_results
+                }
+                for completed, future in enumerate(as_completed(futures), start=1):
+                    result = future.result()
+                    results.append(result)
+                    progress.stage(
+                        progress=0.60 + 0.30 * completed / max(total, 1),
+                        label="候选评估",
+                        detail=(
+                            f"局部搜索并行评估 {completed}/{total} | workers={min(worker_count, total)} | "
+                            f"候选 {result.candidate_index} | obj={result.solution.objective:.1f}"
+                        ),
+                    )
+            return results
+        except (OSError, PermissionError, RuntimeError) as exc:
+            planning_cfg["parallel_fallback_reason"] = f"{type(exc).__name__}: {exc}"
+            progress.stage(
+                progress=0.60,
+                label="候选评估",
+                detail="局部搜索并行不可用，已自动回退串行",
+            )
+
+    results = []
+    for ranked_index, result in enumerate(initial_results, start=1):
+        improved = _improve_candidate_direct(
+            initial_result=result,
+            attachment_options=attachment_options,
+            corridor=corridor,
+            users=users,
+            planning_cfg=planning_cfg,
+            radial_model_data=radial_model_data,
+            progress=progress,
+            progress_index=ranked_index,
+            progress_total=total,
+        )
+        progress.candidate_finished(
+            index=ranked_index,
+            total=total,
+            objective=improved.solution.objective,
+            feasible=improved.solution.feasible,
+        )
+        results.append(improved)
+    return results
+
+
+def _evaluate_initial_candidate_direct(
+    *,
+    candidate_index: int,
+    candidate: Any,
+    base_choices: dict[int, Any],
+    corridor: Any,
+    users: gpd.GeoDataFrame,
+    planning_cfg: dict[str, Any],
+    radial_model_data: RadialTreeModelData,
+) -> CandidateEvaluationResult:
+    """Evaluate one initial candidate in the current process."""
+
+    started_at = time.perf_counter()
+    counters: dict[str, int] = {}
+    solution = _evaluate_candidate_solution(
+        candidate=candidate,
+        choices=base_choices,
+        corridor=corridor,
+        users=users,
+        planning_cfg=planning_cfg,
+        tree_cache={},
+        radial_model_data=radial_model_data,
+        performance_counters=counters,
+    )
+    return CandidateEvaluationResult(
+        candidate_index=candidate_index,
+        solution=solution,
+        duration_s=time.perf_counter() - started_at,
+        milp_solve_count=int(counters.get("milp_solve_count", 0)),
+        milp_cache_hit_count=int(counters.get("milp_cache_hit_count", 0)),
+    )
+
+
+def _improve_candidate_direct(
+    *,
+    initial_result: CandidateEvaluationResult,
+    attachment_options: dict[int, list[Any]],
+    corridor: Any,
+    users: gpd.GeoDataFrame,
+    planning_cfg: dict[str, Any],
+    radial_model_data: RadialTreeModelData,
+    progress: OptimizationProgress | None = None,
+    progress_index: int = 1,
+    progress_total: int = 1,
+) -> CandidateEvaluationResult:
+    """Improve one candidate in the current process."""
+
+    started_at = time.perf_counter()
+    counters: dict[str, int] = {}
+    tree_cache = {
+        _tree_cache_key(
+            candidate_node_id=initial_result.solution.transformer_candidate.node_id,
+            choices=initial_result.solution.attachment_choices,
+        ): initial_result.solution.radial_tree
+    }
+
+    def evaluate(choices: dict[int, Any]) -> EvaluatedSolution:
+        return _evaluate_candidate_solution(
+            candidate=initial_result.solution.transformer_candidate,
+            choices=choices,
+            corridor=corridor,
+            users=users,
+            planning_cfg=planning_cfg,
+            tree_cache=tree_cache,
+            radial_model_data=radial_model_data,
+            performance_counters=counters,
+        )
+
+    improved = improve_attachment_choices(
+        options_by_user=attachment_options,
+        initial_solution=initial_result.solution,
+        evaluate=evaluate,
+        max_iter=int(planning_cfg.get("alns_max_iter", 40)),
+        destroy_ratio=float(planning_cfg.get("alns_destroy_ratio", 0.15)),
+        progress_callback=None
+        if progress is None
+        else lambda iteration, max_iter, changed, current_best: progress.candidate_iteration(
+            index=progress_index,
+            total=progress_total,
+            iteration=iteration,
+            max_iter=max_iter,
+            objective=current_best.objective,
+            improved=changed,
+        ),
+    )
+    return CandidateEvaluationResult(
+        candidate_index=initial_result.candidate_index,
+        solution=improved,
+        duration_s=time.perf_counter() - started_at,
+        milp_solve_count=int(counters.get("milp_solve_count", 0)),
+        milp_cache_hit_count=int(counters.get("milp_cache_hit_count", 0)),
+    )
+
+
+def _init_evaluation_worker(context: dict[str, Any]) -> None:
+    """Set process-local immutable evaluation context."""
+
+    _WORKER_CONTEXT.clear()
+    _WORKER_CONTEXT.update(context)
+
+
+def _evaluate_initial_candidate_worker(candidate_index: int, candidate: Any) -> CandidateEvaluationResult:
+    """Evaluate one initial candidate inside a process worker."""
+
+    return _evaluate_initial_candidate_direct(
+        candidate_index=candidate_index,
+        candidate=candidate,
+        base_choices=_WORKER_CONTEXT["base_choices"],
+        corridor=_WORKER_CONTEXT["corridor"],
+        users=_WORKER_CONTEXT["users"],
+        planning_cfg=_WORKER_CONTEXT["planning_cfg"],
+        radial_model_data=_WORKER_CONTEXT["radial_model_data"],
+    )
+
+
+def _improve_candidate_worker(initial_result: CandidateEvaluationResult) -> CandidateEvaluationResult:
+    """Improve one candidate inside a process worker."""
+
+    return _improve_candidate_direct(
+        initial_result=initial_result,
+        attachment_options=_WORKER_CONTEXT["attachment_options"],
+        corridor=_WORKER_CONTEXT["corridor"],
+        users=_WORKER_CONTEXT["users"],
+        planning_cfg=_WORKER_CONTEXT["planning_cfg"],
+        radial_model_data=_WORKER_CONTEXT["radial_model_data"],
+        progress=None,
+    )
+
+
 def _evaluate_candidate_solution(
     *,
     candidate: Any,
@@ -193,20 +508,80 @@ def _evaluate_candidate_solution(
     corridor: Any,
     users: gpd.GeoDataFrame,
     planning_cfg: dict[str, Any],
+    tree_cache: dict[tuple[str, tuple[str, ...]], Any] | None = None,
+    radial_model_data: RadialTreeModelData | None = None,
+    performance_counters: dict[str, int] | None = None,
 ) -> EvaluatedSolution:
     """Evaluate one transformer candidate plus one set of user attachments."""
 
     diagnostics: list[str] = []
+    infeasible_reasons: list[str] = []
     for option in choices.values():
+        if not option.feasible:
+            diagnostics.append(f"No feasible service corridor was found for user {option.user_id}.")
+            infeasible_reasons.extend(option.infeasible_reasons)
         if option.horizontal_length_m > float(planning_cfg.get("max_service_drop_m", 25.0)) + corridor.resolution_m * 2.0:
             diagnostics.append(
                 f"Service drop for user {option.user_id} exceeds max length: {option.horizontal_length_m:.2f} m."
             )
-    tree = solve_radial_tree(
-        corridor=corridor,
-        root_node_id=candidate.node_id,
-        attachment_node_ids=[option.attach_node_id for option in choices.values()],
-    )
+            infeasible_reasons.append("service_drop_too_long")
+    tree_key = _tree_cache_key(candidate_node_id=candidate.node_id, choices=choices)
+    try:
+        if tree_cache is not None and tree_key in tree_cache:
+            tree = tree_cache[tree_key]
+            if performance_counters is not None:
+                performance_counters["milp_cache_hit_count"] = performance_counters.get("milp_cache_hit_count", 0) + 1
+        else:
+            if performance_counters is not None:
+                performance_counters["milp_solve_count"] = performance_counters.get("milp_solve_count", 0) + 1
+            tree = solve_radial_tree(
+                corridor=corridor,
+                root_node_id=candidate.node_id,
+                attachment_node_ids=[option.attach_node_id for option in choices.values()],
+                planning_cfg=planning_cfg,
+                model_data=radial_model_data,
+            )
+            if tree_cache is not None:
+                tree_cache[tree_key] = tree
+    except ValueError as exc:
+        from src.planning.models import PowerFlowResult, RadialTreeResult
+
+        diagnostics.append(str(exc))
+        infeasible_reasons.append("radial_tree_infeasible")
+        tree = RadialTreeResult(
+            root_node_id=candidate.node_id,
+            selected_edge_ids=[],
+            parent_by_node={},
+            depth_by_node={candidate.node_id: 0},
+            terminal_nodes={candidate.node_id},
+        )
+        power_flow = PowerFlowResult(
+            edge_phase_loads={},
+            edge_phase_kw={},
+            edge_losses_kw={},
+            edge_voltage_drop_pct={},
+            transformer_phase_loads=np.zeros(3, dtype=float),
+            user_voltage_drop_pct={},
+            user_service_drop_pct={},
+            user_connection_nodes={},
+            total_loss_kw=0.0,
+            max_voltage_drop_pct=0.0,
+        )
+        return EvaluatedSolution(
+            transformer_candidate=candidate,
+            radial_tree=tree,
+            attachment_choices=dict(choices),
+            phase_assignment={},
+            power_flow=power_flow,
+            build_cost=float("inf"),
+            loss_cost=0.0,
+            total_unbalance_penalty=0.0,
+            objective=float("inf"),
+            feasible=False,
+            voltage_ok=False,
+            diagnostics=diagnostics,
+            infeasible_reasons=_dedupe_reasons(infeasible_reasons),
+        )
     phase_assignment, edge_phase_loads, edge_phase_kw = optimize_phase_assignment(
         tree=tree,
         attachment_choices=choices,
@@ -223,12 +598,13 @@ def _evaluate_candidate_solution(
         users=users,
         planning_cfg=planning_cfg,
     )
-    voltage_ok, voltage_diagnostics = evaluate_solution_feasibility(
+    voltage_ok, voltage_diagnostics, voltage_reasons = evaluate_solution_feasibility(
         users=users,
         power_flow=power_flow,
         planning_cfg=planning_cfg,
     )
     diagnostics.extend(voltage_diagnostics)
+    infeasible_reasons.extend(voltage_reasons)
 
     build_cost = _estimate_build_cost(
         tree=tree,
@@ -257,6 +633,7 @@ def _evaluate_candidate_solution(
         feasible=bool(voltage_ok and not diagnostics),
         voltage_ok=bool(voltage_ok),
         diagnostics=diagnostics,
+        infeasible_reasons=_dedupe_reasons(infeasible_reasons),
     )
 
 
@@ -337,10 +714,19 @@ def _resolve_planning_v2_config(config: dict[str, Any]) -> dict[str, Any]:
         "segment_unbalance_weight": 1.0,
         "max_service_drop_m": 25.0,
         "max_pole_span_m": 50.0,
+        "pole_user_clearance_m": 5.0,
+        "line_user_clearance_m": 1.0,
         "voltage_drop_max_pct": 7.0,
         "phase_balance_target_ratio": 0.10,
         "phase_balance_max_ratio": 0.15,
         "milp_time_limit_s": 180,
+        "solver_backend": "highs",
+        "mip_gap": 0.05,
+        "parallel_candidate_eval": True,
+        "parallel_workers": 0,
+        "highs_threads_per_worker": 1,
+        "local_search_top_k": 8,
+        "emit_performance_metrics": True,
         "alns_max_iter": 40,
         "alns_destroy_ratio": 0.15,
         "candidate_solution_pool_size": 10,
@@ -351,3 +737,82 @@ def _resolve_planning_v2_config(config: dict[str, Any]) -> dict[str, Any]:
     merged.update(config.get("planning", {}))
     merged.update(config.get("planning_v2", {}))
     return merged
+
+
+def _tree_cache_key(*, candidate_node_id: str, choices: dict[int, Any]) -> tuple[str, tuple[str, ...]]:
+    """Return the stable cache key used for one root plus attachment node set."""
+
+    return (str(candidate_node_id), tuple(sorted({str(option.attach_node_id) for option in choices.values()})))
+
+
+def _resolve_parallel_workers(*, planning_cfg: dict[str, Any], task_count: int) -> int:
+    """Resolve the candidate-evaluation worker count from config and CPU count."""
+
+    if task_count <= 1 or not bool(planning_cfg.get("parallel_candidate_eval", True)):
+        return 1
+    configured = int(planning_cfg.get("parallel_workers", 0))
+    if configured > 0:
+        return max(1, min(int(task_count), configured))
+    cpu_count = os.cpu_count() or 1
+    auto_workers = max(1, cpu_count - 2)
+    return max(1, min(int(task_count), auto_workers))
+
+
+def _use_parallel(*, planning_cfg: dict[str, Any], worker_count: int) -> bool:
+    """Return whether process-based candidate parallelism should be used."""
+
+    return (
+        bool(planning_cfg.get("parallel_candidate_eval", True))
+        and int(worker_count) > 1
+        and "parallel_fallback_reason" not in planning_cfg
+    )
+
+
+def _build_performance_summary(
+    *,
+    total_duration_s: float,
+    corridor_duration_s: float,
+    prefilter_duration_s: float,
+    initial_duration_s: float,
+    local_search_duration_s: float,
+    output_duration_s: float,
+    worker_count: int,
+    initial_results: list[CandidateEvaluationResult],
+    improved_results: list[CandidateEvaluationResult],
+    local_search_top_k: int,
+    planning_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Build stable timing and solver-count metrics for optimization_summary.json."""
+
+    all_results = [*initial_results, *improved_results]
+    return {
+        "total_duration_s": round(float(total_duration_s), 3),
+        "corridor_build_duration_s": round(float(corridor_duration_s), 3),
+        "candidate_prefilter_duration_s": round(float(prefilter_duration_s), 3),
+        "initial_candidate_eval_duration_s": round(float(initial_duration_s), 3),
+        "local_search_duration_s": round(float(local_search_duration_s), 3),
+        "output_generation_duration_s": round(float(output_duration_s), 3),
+        "parallel_candidate_eval": bool(planning_cfg.get("parallel_candidate_eval", True)),
+        "worker_count": int(worker_count),
+        "parallel_fallback_reason": str(planning_cfg.get("parallel_fallback_reason", "")),
+        "highs_threads_per_worker": int(planning_cfg.get("highs_threads_per_worker", 1)),
+        "initial_candidate_count": int(len(initial_results)),
+        "local_search_candidate_count": int(len(improved_results)),
+        "local_search_top_k": int(local_search_top_k),
+        "milp_solve_count": int(sum(result.milp_solve_count for result in all_results)),
+        "milp_cache_hit_count": int(sum(result.milp_cache_hit_count for result in all_results)),
+        "slowest_candidate_duration_s": round(max((result.duration_s for result in all_results), default=0.0), 3),
+    }
+
+
+def _dedupe_reasons(reasons: list[str]) -> list[str]:
+    """Return reason codes once while preserving their original order."""
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for reason in reasons:
+        if not reason or reason in seen:
+            continue
+        seen.add(reason)
+        ordered.append(reason)
+    return ordered
