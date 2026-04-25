@@ -6,7 +6,7 @@ scene:
   origin_x_m: 0
   origin_y_m: 500
   crs: EPSG:3857
-  seed: 98
+  seed: 66
 
 terrain:
   base_type: ridge
@@ -89,25 +89,25 @@ planning:
 
 planning_v2:
   enable_v2_optimizer: true
-  tx_candidate_count: 60
-  tx_prefilter_top_k: 6
-  corridor_safe_margin_m: 12.0
+  tx_candidate_count: 120
+  tx_prefilter_top_k: 16
+  corridor_safe_margin_m: 10.0
   corridor_cluster_count: 6
-  corridor_edge_max_length_m: 120.0
-  corridor_neighbor_count: 12
+  corridor_edge_max_length_m: 100.0
+  corridor_neighbor_count: 16
   corridor_boundary_penalty_weight: 20.0
   build_cost_weight: 1.0
   # 线损目标：线损以 kW 表示，使用权重进入 objective
-  loss_kw_weight: 10000.0
-  path_length_penalty_weight: 20.0
-  max_user_path_length_m: 300.0
-  max_user_path_penalty_weight: 1000.0
-  load_weighted_path_penalty_weight: 1.0
+  loss_kw_weight: 15000.0
+  path_length_penalty_weight: 50.0
+  max_user_path_length_m: 250.0
+  max_user_path_penalty_weight: 5000.0
+  load_weighted_path_penalty_weight: 2.5
   root_feeder_min_count: 3
-  root_feeder_count_penalty_weight: 50000.0
-  phase_unbalance_weight: 3.0
+  root_feeder_count_penalty_weight: 200000.0
+  phase_unbalance_weight: 5.0
   tx_unbalance_weight: 2.0
-  segment_unbalance_weight: 1.0
+  segment_unbalance_weight: 3.0
   max_service_drop_m: 25.0
   max_pole_span_m: 50.0
   pole_user_clearance_m: 5.0
@@ -115,26 +115,26 @@ planning_v2:
   voltage_drop_max_pct: 7.0
   # 压降只作为软惩罚和诊断，不作为 infeasible 判定
   voltage_drop_reference_pct: 7.0
-  voltage_drop_penalty_weight: 50000.0
+  voltage_drop_penalty_weight: 80000.0
   voltage_drop_warning_pct: 10.0
   voltage_drop_top_user_count: 10
   phase_balance_target_ratio: 0.10
   phase_balance_max_ratio: 0.15
-  milp_time_limit_s: 8
+  milp_time_limit_s: 20
   solver_backend: highs
-  mip_gap: 0.15
-  parallel_candidate_eval: false
-  parallel_workers: 1
+  mip_gap: 0.10
+  parallel_candidate_eval: true
+  parallel_workers: 4
   highs_threads_per_worker: 1
-  local_search_top_k: 1
-  local_search_patience: 2
-  local_search_top_options: 1
-  local_search_max_full_evals: 8
+  local_search_top_k: 4
+  local_search_patience: 8
+  local_search_top_options: 2
+  local_search_max_full_evals: 50
   emit_performance_metrics: true
-  alns_max_iter: 20
+  alns_max_iter: 100
   alns_destroy_ratio: 0.15
-  candidate_solution_pool_size: 6
-  final_geometry_check_top_k: 6
+  candidate_solution_pool_size: 16
+  final_geometry_check_top_k: 10
   show_progress: true
   progress_bar_width: 32
 
