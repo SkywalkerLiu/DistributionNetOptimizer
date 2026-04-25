@@ -124,7 +124,11 @@ def build_corridor_graph(
     tree = cKDTree(node_xy)
     allowed_mask = corridor_mask.astype(np.uint8)
     sample_step_m = max(resolution, edge_max_length_m / 18.0)
-    max_neighbors = min(max(6, int(planning_cfg.get("candidate_solution_pool_size", 10))), max(6, len(node_ids) - 1))
+    configured_neighbors = int(planning_cfg.get("corridor_neighbor_count", 12))
+    max_neighbors = min(
+        max(2, configured_neighbors),
+        max(1, len(node_ids) - 1),
+    )
     added_pairs: set[tuple[str, str]] = set()
 
     for index, node_id in enumerate(node_ids):

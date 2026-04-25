@@ -116,6 +116,16 @@ python -m src.main plot-plan --config configs/default_config.yaml
 - `show_progress`：是否显示终端进度条
 - `progress_bar_width`：进度条宽度
 
+### 路径长度与多方向出线控制
+
+- `path_length_penalty_weight`：对用户到配变供电路径长度的惩罚权重。
+- `max_user_path_length_m`：用户到配变主干路径长度的建议上限，超过后触发二次惩罚。
+- `max_user_path_penalty_weight`：超过最大供电路径长度后的惩罚权重。
+- `load_weighted_path_penalty_weight`：负荷加权路径长度惩罚权重。
+- `root_feeder_min_count`：鼓励配变至少向多少个方向出线。
+- `root_feeder_count_penalty_weight`：根节点出线数量不足时的惩罚权重。
+- `corridor_neighbor_count`：每个走廊节点连接的近邻数量，与候选方案池大小无关。
+
 ## 性能优化与运行时间调优
 
 V2 优化的主要耗时来自多次构建 Pyomo 模型并调用 HiGHS 求解径向树 MILP。Pyomo 建模和单个 HiGHS 求解通常不会让整机 CPU 长时间满载，所以看到 CPU 总占用低于 `20%` 不一定代表程序卡死；更常见的原因是候选配变串行评估和重复 MILP 调用。

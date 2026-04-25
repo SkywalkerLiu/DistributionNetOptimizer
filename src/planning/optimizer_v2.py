@@ -773,10 +773,25 @@ def _evaluate_candidate_solution(
         corridor=corridor,
         planning_cfg=planning_cfg,
     )
+    loss_cost = 0.0
     unbalance_penalty = phase_unbalance_penalty(power_flow=power_flow, planning_cfg=planning_cfg)
+    path_penalty, path_diagnostics = _path_length_penalty(
+        tree=tree,
+        choices=choices,
+        corridor=corridor,
+        users=users,
+        planning_cfg=planning_cfg,
+    )
+    root_feeder_penalty, root_feeder_diagnostics = _root_feeder_penalty(
+        tree=tree,
+        planning_cfg=planning_cfg,
+    )
     objective = (
         float(planning_cfg.get("build_cost_weight", 1.0)) * build_cost
+        + float(planning_cfg.get("loss_cost_weight", 2.0)) * loss_cost
         + unbalance_penalty
+        + path_penalty
+        + root_feeder_penalty
         + 1_000_000.0 * len(diagnostics)
     )
     return EvaluatedSolution(
@@ -786,14 +801,134 @@ def _evaluate_candidate_solution(
         phase_assignment=phase_assignment,
         power_flow=power_flow,
         build_cost=float(build_cost),
-        loss_cost=0.0,
+        loss_cost=float(loss_cost),
         total_unbalance_penalty=float(unbalance_penalty),
         objective=float(objective),
         feasible=bool(voltage_ok and not diagnostics),
         voltage_ok=bool(voltage_ok),
         diagnostics=diagnostics,
         infeasible_reasons=_dedupe_reasons(infeasible_reasons),
+        extra_metrics={
+            "path_diagnostics": path_diagnostics,
+            "root_feeder_diagnostics": root_feeder_diagnostics,
+        },
     )
+
+
+def _user_path_length_m(
+    *,
+    tree: Any,
+    option: Any,
+    corridor: Any,
+) -> float:
+    """Return the 3D corridor path length from transformer root to one user's attachment node."""
+
+    from src.planning.radial_tree_milp import path_to_root
+
+    length_m = 0.0
+    for parent, child in path_to_root(tree, option.attach_node_id):
+        edge_id = corridor.graph[parent][child]["edge_id"]
+        length_m += float(corridor.edges[edge_id].length_3d_m)
+    return float(length_m)
+
+
+def _path_length_penalty(
+    *,
+    tree: Any,
+    choices: dict[int, Any],
+    corridor: Any,
+    users: Any,
+    planning_cfg: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    """Return path-length penalty and diagnostics for one evaluated solution."""
+
+    user_by_id = {int(row.user_id): row for row in users.itertuples()}
+    max_user_path_length_m = float(planning_cfg.get("max_user_path_length_m", 300.0))
+    path_weight = float(planning_cfg.get("path_length_penalty_weight", 20.0))
+    max_path_weight = float(planning_cfg.get("max_user_path_penalty_weight", 1000.0))
+    load_weight = float(planning_cfg.get("load_weighted_path_penalty_weight", 1.0))
+
+    rows: list[dict[str, Any]] = []
+    total_load_kva = 0.0
+    load_weighted_path_sum = 0.0
+    penalty = 0.0
+
+    for user_id, option in choices.items():
+        row = user_by_id[int(user_id)]
+        load_kva = float(row.apparent_kva)
+        path_m = _user_path_length_m(tree=tree, option=option, corridor=corridor)
+        service_m = float(option.length_3d_m)
+        total_m = path_m + service_m
+
+        total_load_kva += load_kva
+        load_weighted_path_sum += load_kva * path_m
+
+        penalty += path_weight * load_weight * load_kva * path_m / 100.0
+
+        excess_m = max(0.0, path_m - max_user_path_length_m)
+        if excess_m > 0.0:
+            penalty += max_path_weight * (excess_m / 100.0) ** 2
+
+        rows.append(
+            {
+                "user_id": int(user_id),
+                "path_length_m": float(path_m),
+                "service_drop_length_m": float(service_m),
+                "total_path_plus_service_m": float(total_m),
+                "load_kva": float(load_kva),
+                "excess_path_m": float(excess_m),
+                "attach_node_id": str(option.attach_node_id),
+            }
+        )
+
+    rows.sort(key=lambda item: item["path_length_m"], reverse=True)
+    max_path = rows[0]["path_length_m"] if rows else 0.0
+    worst_user_id = rows[0]["user_id"] if rows else None
+    load_weighted_avg = load_weighted_path_sum / max(total_load_kva, 1e-9)
+
+    diagnostics = {
+        "max_user_path_length_m": round(float(max_path), 3),
+        "worst_path_user_id": worst_user_id,
+        "load_weighted_average_path_length_m": round(float(load_weighted_avg), 3),
+        "max_user_path_length_limit_m": round(float(max_user_path_length_m), 3),
+        "path_length_penalty": round(float(penalty), 3),
+        "top_long_user_paths": [
+            {
+                "user_id": item["user_id"],
+                "path_length_m": round(float(item["path_length_m"]), 3),
+                "service_drop_length_m": round(float(item["service_drop_length_m"]), 3),
+                "total_path_plus_service_m": round(float(item["total_path_plus_service_m"]), 3),
+                "load_kva": round(float(item["load_kva"]), 3),
+                "excess_path_m": round(float(item["excess_path_m"]), 3),
+                "attach_node_id": item["attach_node_id"],
+            }
+            for item in rows[:10]
+        ],
+    }
+    return float(penalty), diagnostics
+
+
+def _root_feeder_penalty(
+    *,
+    tree: Any,
+    planning_cfg: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    """Penalize too few first-level feeders from the transformer root."""
+
+    min_count = int(planning_cfg.get("root_feeder_min_count", 3))
+    weight = float(planning_cfg.get("root_feeder_count_penalty_weight", 50000.0))
+
+    actual_count = sum(1 for parent in tree.parent_by_node.values() if parent == tree.root_node_id)
+    deficit = max(0, min_count - actual_count)
+    penalty = weight * deficit
+
+    diagnostics = {
+        "root_feeder_count": int(actual_count),
+        "root_feeder_min_count": int(min_count),
+        "root_feeder_deficit": int(deficit),
+        "root_feeder_penalty": round(float(penalty), 3),
+    }
+    return float(penalty), diagnostics
 
 
 def _estimate_build_cost(
@@ -864,9 +999,16 @@ def _resolve_planning_v2_config(config: dict[str, Any]) -> dict[str, Any]:
         "tx_prefilter_top_k": 6,
         "corridor_safe_margin_m": 12.0,
         "corridor_cluster_count": 6,
-        "corridor_edge_max_length_m": 180.0,
+        "corridor_edge_max_length_m": 120.0,
+        "corridor_neighbor_count": 12,
         "corridor_boundary_penalty_weight": 20.0,
         "build_cost_weight": 1.0,
+        "path_length_penalty_weight": 20.0,
+        "max_user_path_length_m": 300.0,
+        "max_user_path_penalty_weight": 1000.0,
+        "load_weighted_path_penalty_weight": 1.0,
+        "root_feeder_min_count": 3,
+        "root_feeder_count_penalty_weight": 50000.0,
         "phase_unbalance_weight": 3.0,
         "tx_unbalance_weight": 2.0,
         "segment_unbalance_weight": 1.0,

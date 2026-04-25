@@ -93,9 +93,16 @@ planning_v2:
   tx_prefilter_top_k: 6
   corridor_safe_margin_m: 12.0
   corridor_cluster_count: 6
-  corridor_edge_max_length_m: 180.0
+  corridor_edge_max_length_m: 120.0
+  corridor_neighbor_count: 12
   corridor_boundary_penalty_weight: 20.0
   build_cost_weight: 1.0
+  path_length_penalty_weight: 20.0
+  max_user_path_length_m: 300.0
+  max_user_path_penalty_weight: 1000.0
+  load_weighted_path_penalty_weight: 1.0
+  root_feeder_min_count: 3
+  root_feeder_count_penalty_weight: 50000.0
   phase_unbalance_weight: 3.0
   tx_unbalance_weight: 2.0
   segment_unbalance_weight: 1.0

@@ -112,6 +112,8 @@ def build_summary_v2(
         "voltage": {
             "max_voltage_drop_pct": round(float(solution.power_flow.max_voltage_drop_pct), 5),
         },
+        "path_diagnostics": solution.extra_metrics.get("path_diagnostics", {}),
+        "root_feeder_diagnostics": solution.extra_metrics.get("root_feeder_diagnostics", {}),
         "users": {
             "count": int(len(users)),
             "connected_count": int(users["connected_node_id"].astype(str).ne("").sum()) if "connected_node_id" in users.columns else 0,

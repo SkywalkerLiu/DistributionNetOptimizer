@@ -137,3 +137,4 @@ class EvaluatedSolution:
     voltage_ok: bool
     diagnostics: list[str] = field(default_factory=list)
     infeasible_reasons: list[str] = field(default_factory=list)
+    extra_metrics: dict[str, Any] = field(default_factory=dict)

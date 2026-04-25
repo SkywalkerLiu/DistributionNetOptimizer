@@ -131,7 +131,18 @@ def _solve_highs_flow_tree(
     if solver_backend != "highs":
         raise ValueError(f"Unsupported solver backend '{solver_backend}'. This project currently uses only HiGHS.")
 
-    undirected_edges = model_data.undirected_edges
+    root_component = model_data.component_by_node[root_node_id]
+    component_node_ids = [
+        node_id
+        for node_id in model_data.node_ids
+        if model_data.component_by_node.get(node_id) == root_component
+    ]
+    component_nodes = set(component_node_ids)
+    undirected_edges = [
+        (u, v, weight, edge_id)
+        for u, v, weight, edge_id in model_data.undirected_edges
+        if u in component_nodes and v in component_nodes
+    ]
     if not undirected_edges:
         raise ValueError("The corridor graph has no candidate edges for the radial tree model.")
 
@@ -140,7 +151,18 @@ def _solve_highs_flow_tree(
     required_flow = len(sink_terminals)
     model = pyo.ConcreteModel()
     model.E = pyo.RangeSet(0, len(undirected_edges) - 1)
-    arcs = model_data.arcs
+    arcs: list[tuple[int, str, str]] = []
+    outgoing: dict[str, list[int]] = {node_id: [] for node_id in component_node_ids}
+    incoming: dict[str, list[int]] = {node_id: [] for node_id in component_node_ids}
+    for edge_index, (u, v, _weight, _edge_id) in enumerate(undirected_edges):
+        forward_index = len(arcs)
+        arcs.append((edge_index, u, v))
+        outgoing[u].append(forward_index)
+        incoming[v].append(forward_index)
+        reverse_index = len(arcs)
+        arcs.append((edge_index, v, u))
+        outgoing[v].append(reverse_index)
+        incoming[u].append(reverse_index)
     model.A = pyo.RangeSet(0, len(arcs) - 1)
     model.x = pyo.Var(model.E, domain=pyo.Binary)
     model.flow = pyo.Var(model.A, domain=pyo.NonNegativeReals)
@@ -156,8 +178,8 @@ def _solve_highs_flow_tree(
     model.flow_capacity = pyo.Constraint(model.A, rule=flow_capacity_rule)
 
     def conservation_rule(m: pyo.ConcreteModel, node_id: str) -> pyo.Constraint:
-        outflow = sum(m.flow[arc_index] for arc_index in model_data.outgoing.get(node_id, []))
-        inflow = sum(m.flow[arc_index] for arc_index in model_data.incoming.get(node_id, []))
+        outflow = sum(m.flow[arc_index] for arc_index in outgoing.get(node_id, []))
+        inflow = sum(m.flow[arc_index] for arc_index in incoming.get(node_id, []))
         if node_id == root_node_id:
             rhs = required_flow
         elif node_id in sink_terminals:
@@ -166,7 +188,7 @@ def _solve_highs_flow_tree(
             rhs = 0
         return outflow - inflow == rhs
 
-    model.N = pyo.Set(initialize=model_data.node_ids)
+    model.N = pyo.Set(initialize=component_node_ids)
     model.conservation = pyo.Constraint(model.N, rule=conservation_rule)
 
     solver = pyo.SolverFactory("highs")
