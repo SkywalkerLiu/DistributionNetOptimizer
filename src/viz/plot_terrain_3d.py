@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any
 
 import geopandas as gpd
@@ -64,6 +65,8 @@ class OverlayPoint3D:
     marker: str = "o"
     plotly_symbol: str = "circle"
     text: list[str] | None = None
+    customdata: np.ndarray | None = None
+    hovertemplate: str | None = None
 
 
 def generate_terrain_3d_previews(
@@ -76,9 +79,6 @@ def generate_terrain_3d_previews(
     forest: gpd.GeoDataFrame | None = None,
     water: gpd.GeoDataFrame | None = None,
     manual_no_build: gpd.GeoDataFrame | None = None,
-    planned_lines: gpd.GeoDataFrame | None = None,
-    transformer: gpd.GeoDataFrame | None = None,
-    poles: gpd.GeoDataFrame | None = None,
 ) -> dict[str, Path]:
     """Generate static and interactive 3D terrain preview files."""
 
@@ -103,9 +103,6 @@ def generate_terrain_3d_previews(
         forest=forest,
         water=water,
         manual_no_build=manual_no_build,
-        planned_lines=planned_lines,
-        transformer=transformer,
-        poles=poles,
     )
 
     outputs = {
@@ -120,6 +117,7 @@ def generate_terrain_3d_previews(
         azim_deg=azim_deg,
         lines=lines,
         points=points,
+        title="Terrain 3D Preview",
     )
     _save_plotly_surface(
         surface=surface,
@@ -129,6 +127,76 @@ def generate_terrain_3d_previews(
         azim_deg=azim_deg,
         lines=lines,
         points=points,
+        title="Terrain 3D Preview",
+    )
+    return outputs
+
+
+def generate_optimized_plan_3d_previews(
+    *,
+    dtm: np.ndarray,
+    profile: dict[str, Any],
+    output_dir: str | Path,
+    visualization_config: dict[str, Any] | None = None,
+    users: gpd.GeoDataFrame | None = None,
+    forest: gpd.GeoDataFrame | None = None,
+    water: gpd.GeoDataFrame | None = None,
+    manual_no_build: gpd.GeoDataFrame | None = None,
+    planned_lines: gpd.GeoDataFrame | None = None,
+    transformer: gpd.GeoDataFrame | None = None,
+    poles: gpd.GeoDataFrame | None = None,
+) -> dict[str, Path]:
+    """Generate static and interactive 3D optimized-plan files."""
+
+    cfg = visualization_config or {}
+    plots_dir = Path(output_dir)
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    max_grid_size = _resolve_max_grid_size(cfg.get("terrain_3d_max_grid_size", 0))
+    vertical_exaggeration = float(cfg.get("terrain_3d_vertical_exaggeration", 3.0))
+    elev_deg = float(cfg.get("terrain_3d_camera_elev_deg", 40.0))
+    azim_deg = float(cfg.get("terrain_3d_camera_azim_deg", -60.0))
+
+    surface = downsample_terrain_surface(
+        dtm=dtm,
+        profile=profile,
+        max_grid_size=max_grid_size,
+    )
+    lines, points = build_optimized_plan_3d_overlays(
+        dtm=dtm,
+        profile=profile,
+        users=users,
+        forest=forest,
+        water=water,
+        manual_no_build=manual_no_build,
+        planned_lines=planned_lines,
+        transformer=transformer,
+        poles=poles,
+    )
+
+    outputs = {
+        "optimized_plan_3d_static": plots_dir / "optimized_plan_3d_static.png",
+        "optimized_plan_3d_dynamic": plots_dir / "optimized_plan_3d_dynamic.html",
+    }
+    _save_matplotlib_surface(
+        surface=surface,
+        output_path=outputs["optimized_plan_3d_static"],
+        vertical_exaggeration=vertical_exaggeration,
+        elev_deg=elev_deg,
+        azim_deg=azim_deg,
+        lines=lines,
+        points=points,
+        title="Optimized Plan 3D",
+    )
+    _save_plotly_surface(
+        surface=surface,
+        output_path=outputs["optimized_plan_3d_dynamic"],
+        vertical_exaggeration=vertical_exaggeration,
+        elev_deg=elev_deg,
+        azim_deg=azim_deg,
+        lines=lines,
+        points=points,
+        title="Optimized Plan 3D",
     )
     return outputs
 
@@ -188,9 +256,6 @@ def build_scene_3d_overlays(
     forest: gpd.GeoDataFrame | None = None,
     water: gpd.GeoDataFrame | None = None,
     manual_no_build: gpd.GeoDataFrame | None = None,
-    planned_lines: gpd.GeoDataFrame | None = None,
-    transformer: gpd.GeoDataFrame | None = None,
-    poles: gpd.GeoDataFrame | None = None,
 ) -> tuple[list[OverlayLine3D], list[OverlayPoint3D]]:
     """Build 3D overlay traces for points and boundaries on the terrain."""
 
@@ -234,10 +299,50 @@ def build_scene_3d_overlays(
             z_offset=line_offset * 1.3,
         )
     )
+
+    points.extend(
+        _build_user_point_overlays(
+            users=users,
+            dtm=dtm,
+            profile=profile,
+            z_offset=point_offset,
+        )
+    )
+
+    return lines, points
+
+
+def build_optimized_plan_3d_overlays(
+    *,
+    dtm: np.ndarray,
+    profile: dict[str, Any],
+    users: gpd.GeoDataFrame | None = None,
+    forest: gpd.GeoDataFrame | None = None,
+    water: gpd.GeoDataFrame | None = None,
+    manual_no_build: gpd.GeoDataFrame | None = None,
+    planned_lines: gpd.GeoDataFrame | None = None,
+    transformer: gpd.GeoDataFrame | None = None,
+    poles: gpd.GeoDataFrame | None = None,
+) -> tuple[list[OverlayLine3D], list[OverlayPoint3D]]:
+    """Build 3D overlay traces for optimized network plan outputs."""
+
+    lines, points = build_scene_3d_overlays(
+        dtm=dtm,
+        profile=profile,
+        users=users,
+        forest=forest,
+        water=water,
+        manual_no_build=manual_no_build,
+    )
+
+    z_span = float(dtm.max() - dtm.min()) or 1.0
+    line_offset = max(0.6, z_span * 0.003)
+    point_offset = max(1.2, z_span * 0.006)
+
     if planned_lines is not None and not planned_lines.empty and "line_type" in planned_lines.columns:
         for line_type, label, color, width in (
-            ("lv_line", "LV ABCN Lines", "#222222", 3.0),
-            ("service_drop", "Service Drops", "#ff7f00", 2.2),
+            ("lv_line", "Planned Lines", "#222222", 3.0),
+            ("service_drop", "Service Drop", "#ff7f00", 2.2),
         ):
             subset = planned_lines.loc[planned_lines["line_type"] == line_type]
             lines.extend(
@@ -263,15 +368,6 @@ def build_scene_3d_overlays(
                 z_offset=line_offset * 1.45,
             )
         )
-
-    points.extend(
-        _build_user_point_overlays(
-            users=users,
-            dtm=dtm,
-            profile=profile,
-            z_offset=point_offset,
-        )
-    )
 
     transformer_points = _build_point_overlay(
         gdf=transformer,
@@ -351,6 +447,7 @@ def _save_matplotlib_surface(
     azim_deg: float,
     lines: list[OverlayLine3D],
     points: list[OverlayPoint3D],
+    title: str,
 ) -> None:
     """Save a static PNG terrain surface preview."""
 
@@ -401,7 +498,7 @@ def _save_matplotlib_surface(
         seen_labels.add(point.label)
 
     ax.set_title(
-        "Terrain 3D Preview With Scene Overlays\n"
+        f"{title}\n"
         f"{_surface_resolution_label(surface)}"
     )
     ax.set_xlabel("X (m)")
@@ -434,6 +531,7 @@ def _save_plotly_surface(
     azim_deg: float,
     lines: list[OverlayLine3D],
     points: list[OverlayPoint3D],
+    title: str,
 ) -> None:
     """Save an interactive HTML terrain surface preview."""
 
@@ -498,16 +596,14 @@ def _save_plotly_surface(
                     "line": {"color": "white", "width": 0.5},
                 },
                 text=point.text,
-                hovertemplate=_point_hover_template(point.label, point.text),
+                customdata=point.customdata,
+                hovertemplate=point.hovertemplate or _point_hover_template(point.label, point.text),
             )
         )
         shown_labels.add(point.label)
 
     fig.update_layout(
-        title=(
-            "Terrain 3D Preview With Scene Overlays"
-            f" ({_surface_resolution_label(surface)})"
-        ),
+        title=f"{title} ({_surface_resolution_label(surface)})",
         scene={
             "xaxis_title": "X (m)",
             "yaxis_title": "Y (m)",
@@ -519,7 +615,8 @@ def _save_plotly_surface(
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0},
         margin={"l": 0, "r": 0, "t": 80, "b": 0},
     )
-    fig.write_html(output_path, include_plotlyjs="cdn")
+    html = fig.to_html(include_plotlyjs="cdn", full_html=True)
+    output_path.write_text(_decode_non_ascii_json_escapes(html), encoding="utf-8")
 
 
 def _surface_resolution_label(surface: TerrainSurfacePreview) -> str:
@@ -534,6 +631,18 @@ def _surface_resolution_label(surface: TerrainSurfacePreview) -> str:
         f"sampled {surface.sampled_width}x{surface.sampled_height} from "
         f"{surface.original_width}x{surface.original_height}"
     )
+
+
+def _decode_non_ascii_json_escapes(html: str) -> str:
+    """Keep Plotly HTML readable for non-ASCII hover labels."""
+
+    def replace(match: re.Match[str]) -> str:
+        codepoint = int(match.group(1), 16)
+        if codepoint < 0x80:
+            return match.group(0)
+        return chr(codepoint)
+
+    return re.sub(r"\\u([0-9a-fA-F]{4})", replace, html)
 
 
 def _build_line_overlays(
@@ -610,6 +719,8 @@ def _build_point_overlay(
     marker: str = "o",
     plotly_symbol: str = "circle",
     z_column: str | None = None,
+    customdata: np.ndarray | None = None,
+    hovertemplate: str | None = None,
 ) -> OverlayPoint3D | None:
     """Convert a point layer into a terrain-aware 3D point overlay."""
 
@@ -642,6 +753,8 @@ def _build_point_overlay(
         marker=marker,
         plotly_symbol=plotly_symbol,
         text=text,
+        customdata=customdata,
+        hovertemplate=hovertemplate,
     )
 
 
@@ -657,6 +770,16 @@ def _build_user_point_overlays(
     if users is None or users.empty:
         return []
 
+    customdata = _user_hover_customdata(users)
+    hovertemplate = (
+        "用户编号: %{customdata[0]}<br>"
+        "用户类型: %{customdata[1]}<br>"
+        "聚落类型: %{customdata[2]}<br>"
+        "簇编号: %{customdata[3]}<br>"
+        "负荷: %{customdata[4]:.1f} kW<br>"
+        "相别类型: %{customdata[5]}<extra></extra>"
+    )
+
     if "assigned_phase" not in users.columns or users["assigned_phase"].fillna("").eq("").all():
         overlay = _build_point_overlay(
             gdf=users,
@@ -670,6 +793,8 @@ def _build_user_point_overlays(
             text_prefix="user_id",
             marker="o",
             plotly_symbol="circle",
+            customdata=customdata,
+            hovertemplate=hovertemplate,
         )
         return [overlay] if overlay is not None else []
 
@@ -682,6 +807,7 @@ def _build_user_point_overlays(
     }
     for phase, (label, color) in phase_styles.items():
         subset = users.loc[users["assigned_phase"] == phase]
+        subset_customdata = _user_hover_customdata(subset)
         overlay = _build_point_overlay(
             gdf=subset,
             dtm=dtm,
@@ -694,10 +820,71 @@ def _build_user_point_overlays(
             text_prefix="user_id",
             marker="o",
             plotly_symbol="circle",
+            customdata=subset_customdata,
+            hovertemplate=hovertemplate,
         )
         if overlay is not None:
             overlays.append(overlay)
     return overlays
+
+
+def _user_hover_customdata(users: gpd.GeoDataFrame) -> np.ndarray:
+    """Build Plotly customdata rows for user hover cards."""
+
+    rows: list[list[Any]] = []
+    for row in users.itertuples():
+        rows.append(
+            [
+                _format_user_id(getattr(row, "user_id", "")),
+                _user_type_label(getattr(row, "user_type", "")),
+                _settlement_type_label(getattr(row, "settlement_type", "")),
+                _display_cluster_id(getattr(row, "cluster_id", "")),
+                float(getattr(row, "load_kw", 0.0)),
+                str(getattr(row, "phase_type", "")),
+            ]
+        )
+    return np.asarray(rows, dtype=object)
+
+
+def _format_user_id(value: Any) -> str:
+    """Format numeric user ids as U001-style labels."""
+
+    try:
+        return f"U{int(value):03d}"
+    except (TypeError, ValueError):
+        text = str(value)
+        return text if text.startswith("U") else f"U{text}"
+
+
+def _user_type_label(value: Any) -> str:
+    """Return a display label for configured user types."""
+
+    labels = {
+        "normal_residential": "普通住户",
+        "high_power_user": "大功率用户",
+    }
+    return labels.get(str(value), str(value) if str(value) else "-")
+
+
+def _settlement_type_label(value: Any) -> str:
+    """Return a display label for clustered/scattered settlement types."""
+
+    labels = {
+        "clustered": "簇内居民",
+        "scattered": "散户",
+    }
+    return labels.get(str(value), str(value) if str(value) else "-")
+
+
+def _display_cluster_id(value: Any) -> str:
+    """Normalize empty cluster ids for hover display."""
+
+    if value is None:
+        return "-"
+    text = str(value)
+    if text.lower() in {"", "none", "nan", "null"}:
+        return "-"
+    return text
 
 
 def _build_vertical_support_overlays(

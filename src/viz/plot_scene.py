@@ -36,8 +36,7 @@ def generate_scene_plots(
     outputs = {
         "terrain_preview": plots_dir / "terrain_preview.png",
         "slope_preview": plots_dir / "slope_preview.png",
-        "scene_overview": plots_dir / "scene_overview.png",
-        "terrain_with_features": plots_dir / "terrain_with_features.png",
+        "scene_2d": plots_dir / "scene_2d.png",
         "forbidden_mask": plots_dir / "forbidden_mask.png",
     }
 
@@ -68,18 +67,8 @@ def generate_scene_plots(
     _save_overlay_plot(
         background=dtm,
         profile=profile,
-        title="Terrain With Features",
-        output_path=outputs["terrain_with_features"],
-        users=users,
-        forest=forest,
-        water=water,
-        manual_no_build=manual_no_build,
-    )
-    _save_overlay_plot(
-        background=dtm,
-        profile=profile,
-        title="Scene Overview",
-        output_path=outputs["scene_overview"],
+        title="Scene 2D",
+        output_path=outputs["scene_2d"],
         users=users,
         forest=forest,
         water=water,
@@ -143,7 +132,7 @@ def _save_overlay_plot(
     if not manual_no_build.empty:
         manual_no_build.plot(ax=ax, facecolor="none", edgecolor="#e03c2a", linewidth=2.0, linestyle="--")
     if not users.empty:
-        users.plot(ax=ax, marker=".", markersize=10, facecolor="#000000", edgecolor="white", linewidth=0.5, alpha=0.90)
+        _plot_users(ax=ax, users=users)
 
     legend_handles = [
         Patch(facecolor="#4a9e5c", edgecolor="#1d5e2e", alpha=0.20, linewidth=1.4, label="Forest"),
@@ -158,7 +147,29 @@ def _save_overlay_plot(
             markeredgecolor="white",
             markersize=7,
             linewidth=0.5,
-            label="Users",
+            label="Normal Residential",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="^",
+            color="w",
+            markerfacecolor="#f57c00",
+            markeredgecolor="white",
+            markersize=7,
+            linewidth=0.5,
+            label="High Power User",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="x",
+            color="#7b1fa2",
+            markerfacecolor="#7b1fa2",
+            markeredgecolor="#7b1fa2",
+            markersize=7,
+            linewidth=0.0,
+            label="Scattered User",
         ),
     ]
 
@@ -178,6 +189,56 @@ def _save_overlay_plot(
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
+
+
+def _plot_users(*, ax: Any, users: gpd.GeoDataFrame) -> None:
+    """Plot users by load type and settlement type."""
+
+    settlement = (
+        users["settlement_type"]
+        if "settlement_type" in users.columns
+        else np.full(len(users), "clustered", dtype=object)
+    )
+    scattered = users.loc[settlement == "scattered"]
+    clustered = users.loc[settlement != "scattered"]
+
+    user_type = (
+        clustered["user_type"]
+        if "user_type" in clustered.columns
+        else np.full(len(clustered), "normal_residential", dtype=object)
+    )
+    normal = clustered.loc[user_type != "high_power_user"]
+    high_power = clustered.loc[user_type == "high_power_user"]
+
+    if not normal.empty:
+        normal.plot(
+            ax=ax,
+            marker=".",
+            markersize=16,
+            facecolor="#000000",
+            edgecolor="white",
+            linewidth=0.5,
+            alpha=0.90,
+        )
+    if not high_power.empty:
+        high_power.plot(
+            ax=ax,
+            marker="^",
+            markersize=28,
+            facecolor="#f57c00",
+            edgecolor="white",
+            linewidth=0.6,
+            alpha=0.95,
+        )
+    if not scattered.empty:
+        scattered.plot(
+            ax=ax,
+            marker="x",
+            markersize=38,
+            color="#7b1fa2",
+            linewidth=1.2,
+            alpha=0.95,
+        )
 
 
 def _extent(profile: dict[str, Any]) -> tuple[float, float, float, float]:

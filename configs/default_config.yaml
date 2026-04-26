@@ -1,10 +1,10 @@
 scene:
-  width_m: 500
-  height_m: 500
+  width_m: 400
+  height_m: 600
   max_elevation_m: 100
   resolution_m: 1
   origin_x_m: 0
-  origin_y_m: 500
+  origin_y_m: 600
   crs: EPSG:3857
   seed: 66
 
@@ -28,21 +28,31 @@ terrain:
 
 users:
   count: 50
-  min_spacing_m: 30
-  distribution_mode: clustered
-  cluster_count: 5
-  cluster_radius_m: 200
+
+  distribution_mode: clustered_with_scattered
+
+  clustered_count: 45
+  scattered_count: 5
+
+  cluster_size_min: 3
+  cluster_size_max: 8
+  cluster_diameter_m: 10.0
+  cluster_center_min_spacing_m: 40.0
+
+  scattered_min_distance_from_cluster_m: 30.0
+  scattered_min_spacing_m: 30.0
+
   load_groups:
-    - count: 40
+    - name: normal_residential
+      count: 40
       load_kw: 7.0
       power_factor: 0.85
       phase_type: single
-    - count: 10
-      load_kw: 12.0
+    - name: high_power_user
+      count: 10
+      load_kw: 10.0
       power_factor: 0.85
       phase_type: single
-  load_kw_range: [7.0, 12.0]
-  power_factor_range: [0.85, 0.85]
   default_phase_type: single
   importance_range: [1, 3]
 

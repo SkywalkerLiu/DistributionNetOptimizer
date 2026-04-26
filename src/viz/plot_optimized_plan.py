@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +14,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 from src.io.raster_io import array_bounds
-from src.viz.plot_terrain_3d import generate_terrain_3d_previews
+from src.viz.plot_terrain_3d import generate_optimized_plan_3d_previews
 
 
 PHASE_COLORS = {"A": "#ffd400", "B": "#2ca25f", "C": "#e53935", "ABC": "#984ea3", "": "#777777"}
@@ -61,7 +60,7 @@ def generate_optimized_plan_plots(
         planned_lines=planned_lines,
         output_path=outputs["optimized_plan_2d"],
     )
-    preview_outputs = generate_terrain_3d_previews(
+    preview_outputs = generate_optimized_plan_3d_previews(
         dtm=dtm,
         profile=profile,
         output_dir=plots_dir,
@@ -74,8 +73,7 @@ def generate_optimized_plan_plots(
         transformer=transformer,
         poles=poles,
     )
-    shutil.copyfile(preview_outputs["terrain_3d_png"], outputs["optimized_plan_3d_static"])
-    shutil.copyfile(preview_outputs["terrain_3d_html"], outputs["optimized_plan_3d_dynamic"])
+    outputs.update(preview_outputs)
     return outputs
 
 

@@ -9,7 +9,11 @@ import numpy as np
 from shapely.geometry import LineString, Point, Polygon
 
 from src.io.raster_io import build_raster_profile
-from src.viz.plot_terrain_3d import downsample_terrain_surface, generate_terrain_3d_previews
+from src.viz.plot_terrain_3d import (
+    downsample_terrain_surface,
+    generate_optimized_plan_3d_previews,
+    generate_terrain_3d_previews,
+)
 
 
 def test_downsample_terrain_surface_limits_grid_size() -> None:
@@ -61,7 +65,167 @@ def test_generate_terrain_3d_previews_writes_png_and_html() -> None:
     )
     crs = "EPSG:3857"
     users = gpd.GeoDataFrame(
-        {"user_id": [1, 2], "elev_m": [20.0, 30.0]},
+        {
+            "user_id": [1, 2],
+            "user_type": ["normal_residential", "high_power_user"],
+            "settlement_type": ["clustered", "scattered"],
+            "cluster_id": ["C001", None],
+            "load_kw": [7.0, 10.0],
+            "phase_type": ["single", "single"],
+            "assigned_phase": ["", ""],
+            "elev_m": [20.0, 30.0],
+        },
+        geometry=[Point(15.0, 80.0), Point(35.0, 40.0)],
+        crs=crs,
+    )
+    forest = gpd.GeoDataFrame(
+        {"obs_id": [1]},
+        geometry=[Polygon([(10.0, 70.0), (30.0, 70.0), (30.0, 55.0), (10.0, 55.0)])],
+        crs=crs,
+    )
+    water = gpd.GeoDataFrame(
+        {"obs_id": [1]},
+        geometry=[Polygon([(45.0, 95.0), (65.0, 95.0), (65.0, 75.0), (45.0, 75.0)])],
+        crs=crs,
+    )
+    manual = gpd.GeoDataFrame(
+        {"obs_id": [1]},
+        geometry=[Polygon([(50.0, 35.0), (70.0, 35.0), (70.0, 20.0), (50.0, 20.0)])],
+        crs=crs,
+    )
+    outputs = generate_terrain_3d_previews(
+        dtm=dtm,
+        profile=profile,
+        output_dir=tmp_path,
+        visualization_config={"terrain_3d_max_grid_size": 12},
+        users=users,
+        forest=forest,
+        water=water,
+        manual_no_build=manual,
+    )
+
+    assert outputs["terrain_3d_png"].exists()
+    assert outputs["terrain_3d_html"].exists()
+    assert outputs["terrain_3d_png"].stat().st_size > 0
+    assert outputs["terrain_3d_html"].stat().st_size > 0
+    html = outputs["terrain_3d_html"].read_text(encoding="utf-8")
+    assert "Users" in html
+    assert "Forest" in html
+    assert "Water" in html
+    assert "Manual No-Build" in html
+    assert "用户编号" in html
+    assert "负荷" in html
+    assert "LV Poles" not in html
+    assert "Planned Lines" not in html
+    assert "Transformer" not in html
+    assert "Service Drop" not in html
+
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_terrain_3d_preview_does_not_include_optimized_plan_layers() -> None:
+    tmp_path = _workspace_tmpdir("viz3d_terrain_only")
+    dtm, profile, layers = _preview_layers()
+
+    outputs = generate_terrain_3d_previews(
+        dtm=dtm,
+        profile=profile,
+        output_dir=tmp_path,
+        visualization_config={"terrain_3d_max_grid_size": 12},
+        users=layers["users"],
+        forest=layers["forest"],
+        water=layers["water"],
+        manual_no_build=layers["manual"],
+    )
+
+    html = outputs["terrain_3d_html"].read_text(encoding="utf-8")
+    assert "Users" in html
+    assert "Forest" in html
+    assert "Water" in html
+    assert "Manual No-Build" in html
+    assert "LV Poles" not in html
+    assert "Planned Lines" not in html
+    assert "Transformer" not in html
+    assert "Service Drop" not in html
+
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_optimized_plan_3d_dynamic_includes_plan_layers() -> None:
+    tmp_path = _workspace_tmpdir("viz3d_optimized")
+    dtm, profile, layers = _preview_layers()
+
+    outputs = generate_optimized_plan_3d_previews(
+        dtm=dtm,
+        profile=profile,
+        output_dir=tmp_path,
+        visualization_config={"terrain_3d_max_grid_size": 12},
+        users=layers["users"],
+        forest=layers["forest"],
+        water=layers["water"],
+        manual_no_build=layers["manual"],
+        planned_lines=layers["planned_lines"],
+        transformer=layers["transformer"],
+        poles=layers["poles"],
+    )
+
+    assert outputs["optimized_plan_3d_static"].exists()
+    assert outputs["optimized_plan_3d_dynamic"].exists()
+    html = outputs["optimized_plan_3d_dynamic"].read_text(encoding="utf-8")
+    assert "LV Poles" in html
+    assert "Planned Lines" in html
+    assert "Transformer" in html
+    assert "Service Drop" in html
+
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_terrain_3d_user_hover_contains_load_and_user_id() -> None:
+    tmp_path = _workspace_tmpdir("viz3d_hover")
+    dtm, profile, layers = _preview_layers()
+
+    outputs = generate_terrain_3d_previews(
+        dtm=dtm,
+        profile=profile,
+        output_dir=tmp_path,
+        visualization_config={"terrain_3d_max_grid_size": 12},
+        users=layers["users"],
+        forest=layers["forest"],
+        water=layers["water"],
+        manual_no_build=layers["manual"],
+    )
+
+    html = outputs["terrain_3d_html"].read_text(encoding="utf-8")
+    assert "用户编号" in html
+    assert "负荷" in html
+    assert "U001" in html
+    assert "7.0" in html
+
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def _preview_layers():
+    dtm = np.linspace(0.0, 100.0, num=24 * 18, dtype=np.float32).reshape(24, 18)
+    profile = build_raster_profile(
+        width=18,
+        height=24,
+        resolution=5.0,
+        crs="EPSG:3857",
+        origin_x=0.0,
+        origin_y=120.0,
+    )
+    crs = "EPSG:3857"
+    users = gpd.GeoDataFrame(
+        {
+            "user_id": [1, 2],
+            "user_type": ["normal_residential", "high_power_user"],
+            "settlement_type": ["clustered", "scattered"],
+            "cluster_id": ["C001", None],
+            "load_kw": [7.0, 10.0],
+            "phase_type": ["single", "single"],
+            "assigned_phase": ["", ""],
+            "elev_m": [20.0, 30.0],
+        },
         geometry=[Point(15.0, 80.0), Point(35.0, 40.0)],
         crs=crs,
     )
@@ -81,8 +245,16 @@ def test_generate_terrain_3d_previews_writes_png_and_html() -> None:
         crs=crs,
     )
     planned_lines = gpd.GeoDataFrame(
-        {"line_id": [1]},
-        geometry=[LineString([(20.0, 30.0), (40.0, 30.0), (55.0, 50.0)])],
+        {"line_id": [1, 2], "line_type": ["lv_line", "service_drop"]},
+        geometry=[
+            LineString([(20.0, 30.0), (40.0, 30.0), (55.0, 50.0)]),
+            LineString([(35.0, 40.0), (55.0, 50.0)]),
+        ],
+        crs=crs,
+    )
+    transformer = gpd.GeoDataFrame(
+        {"transformer_id": ["TX1"], "elev_m": [40.0]},
+        geometry=[Point(55.0, 50.0)],
         crs=crs,
     )
     poles = gpd.GeoDataFrame(
@@ -95,32 +267,15 @@ def test_generate_terrain_3d_previews_writes_png_and_html() -> None:
         geometry=[Point(20.0, 30.0), Point(55.0, 50.0)],
         crs=crs,
     )
-
-    outputs = generate_terrain_3d_previews(
-        dtm=dtm,
-        profile=profile,
-        output_dir=tmp_path,
-        visualization_config={"terrain_3d_max_grid_size": 12},
-        users=users,
-        forest=forest,
-        water=water,
-        manual_no_build=manual,
-        planned_lines=planned_lines,
-        poles=poles,
-    )
-
-    assert outputs["terrain_3d_png"].exists()
-    assert outputs["terrain_3d_html"].exists()
-    assert outputs["terrain_3d_png"].stat().st_size > 0
-    assert outputs["terrain_3d_html"].stat().st_size > 0
-    html = outputs["terrain_3d_html"].read_text(encoding="utf-8")
-    assert "Users" in html
-    assert "Forest" in html
-    assert "Water" in html
-    assert "Manual No-Build" in html
-    assert "LV Poles" in html
-
-    shutil.rmtree(tmp_path, ignore_errors=True)
+    return dtm, profile, {
+        "users": users,
+        "forest": forest,
+        "water": water,
+        "manual": manual,
+        "planned_lines": planned_lines,
+        "transformer": transformer,
+        "poles": poles,
+    }
 
 
 def _workspace_tmpdir(name: str) -> Path:

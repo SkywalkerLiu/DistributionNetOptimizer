@@ -201,7 +201,6 @@ def generate_scene(*, config: dict[str, Any], project_root: Path) -> dict[str, P
             forest=obstacles["forest"],
             water=obstacles["water"],
             manual_no_build=obstacles["manual_no_build"],
-            planned_lines=_read_or_empty(paths["features"], "planned_lines"),
         )
 
     return paths
@@ -283,7 +282,6 @@ def plot_terrain_3d(*, config: dict[str, Any], project_root: Path) -> dict[str, 
     forest = _read_or_empty(paths["features"], "forest")
     water = _read_or_empty(paths["features"], "water")
     manual = _read_or_empty(paths["features"], "manual_no_build")
-    planned_lines = _read_or_empty(paths["features"], "planned_lines")
     generate_terrain_3d_previews(
         dtm=dtm,
         profile=profile,
@@ -293,7 +291,6 @@ def plot_terrain_3d(*, config: dict[str, Any], project_root: Path) -> dict[str, 
         forest=forest,
         water=water,
         manual_no_build=manual,
-        planned_lines=planned_lines,
     )
     return paths
 

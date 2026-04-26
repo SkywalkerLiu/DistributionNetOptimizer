@@ -14,6 +14,9 @@ FEATURE_LAYER_DEFINITIONS: dict[str, tuple[str, dict[str, str]]] = {
         "Point",
         {
             "user_id": "int64",
+            "user_type": "object",
+            "settlement_type": "object",
+            "cluster_id": "object",
             "load_kw": "float64",
             "power_factor": "float64",
             "phase_type": "object",
