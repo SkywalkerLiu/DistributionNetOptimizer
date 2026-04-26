@@ -6,6 +6,7 @@ import geopandas as gpd
 import numpy as np
 
 from src.planning.models import CorridorGraph, EvaluatedSolution
+from src.planning.transformer_sizing import recommend_transformer_capacity
 from src.planning.voltage_eval import phase_unbalance_ratio
 
 
@@ -21,6 +22,10 @@ def build_summary_v2(
     """Build the optimization summary emitted by the V2 pipeline."""
 
     phase_load = solution.power_flow.transformer_phase_loads
+    capacity_recommendation = recommend_transformer_capacity(
+        transformer_phase_loads=phase_load,
+        planning_cfg=planning_cfg,
+    )
     non_service = planned_lines.loc[planned_lines["line_type"] == "lv_line"]
     shared_unbalance = []
     for row in non_service.itertuples():
@@ -60,6 +65,7 @@ def build_summary_v2(
         "top_diagnostics": diagnostics[:5],
         "violation_examples": _violation_examples(planned_lines=planned_lines, poles=poles),
         "objective": {
+            "objective_mode": str(planning_cfg.get("objective_mode", "weighted_sum")),
             "total": round(float(solution.objective), 3),
             "build_cost": round(float(solution.build_cost), 3),
             "loss_penalty": round(float(solution.loss_cost), 3),
@@ -77,16 +83,21 @@ def build_summary_v2(
         "transformer": {
             "id": "TX1",
             "candidate_rank": int(solution.transformer_candidate.rank),
-            "capacity_kva": float(planning_cfg.get("transformer_capacity_kva", 630.0)),
-            "loading_kva": round(float(phase_load.sum()), 3),
-            "loading_ratio": round(
-                float(phase_load.sum()) / max(float(planning_cfg.get("transformer_capacity_kva", 630.0)), 1.0),
-                5,
-            ),
             "x": round(float(solution.transformer_candidate.x), 3),
             "y": round(float(solution.transformer_candidate.y), 3),
             "elev_m": round(float(solution.transformer_candidate.z), 3),
+            "capacity_enforced_during_optimization": bool(planning_cfg.get("transformer_capacity_enforced", False)),
+            "configured_capacity_kva": planning_cfg.get("transformer_capacity_kva"),
+            "raw_loading_kva": capacity_recommendation["raw_loading_kva"],
+            "demand_factor": capacity_recommendation["demand_factor"],
+            "effective_loading_kva": capacity_recommendation["effective_loading_kva"],
+            "target_loading_ratio": capacity_recommendation["target_loading_ratio"],
+            "required_capacity_kva": capacity_recommendation["required_capacity_kva"],
+            "recommended_capacity_kva": capacity_recommendation["recommended_capacity_kva"],
+            "recommended_loading_ratio": capacity_recommendation["recommended_loading_ratio"],
+            "standard_capacities_kva": capacity_recommendation["standard_capacities_kva"],
         },
+        "transformer_sizing": capacity_recommendation,
         "line_totals": {
             "count": int(len(planned_lines)),
             "total_3d_length_m": round(float(planned_lines["length_3d_m"].sum()) if not planned_lines.empty else 0.0, 3),
@@ -116,6 +127,7 @@ def build_summary_v2(
             "loss_penalty": round(float(solution.loss_cost), 3),
         },
         "voltage": _voltage_summary(solution=solution, planning_cfg=planning_cfg),
+        "path_constraints": _path_constraints_summary(solution=solution, planning_cfg=planning_cfg),
         "max_current_line": _max_current_line_summary(corridor=corridor, solution=solution),
         "path_diagnostics": solution.extra_metrics.get("path_diagnostics", {}),
         "root_feeder_diagnostics": solution.extra_metrics.get("root_feeder_diagnostics", {}),
@@ -133,6 +145,7 @@ def _voltage_summary(
 ) -> dict[str, Any]:
     power_flow = solution.power_flow
     diag = solution.extra_metrics.get("voltage_diagnostics", {})
+    priority = solution.extra_metrics.get("voltage_priority", {})
     top_count = int(planning_cfg.get("voltage_drop_top_user_count", 10))
 
     ranked_users = sorted(
@@ -164,10 +177,35 @@ def _voltage_summary(
             ),
         ),
         "warning_pct": diag.get("warning_pct", float(planning_cfg.get("voltage_drop_warning_pct", 10.0))),
+        "mean_user_voltage_drop_pct": round(float(priority.get("mean_user_voltage_drop_pct", 0.0)), 5),
+        "load_weighted_mean_user_voltage_drop_pct": round(
+            float(priority.get("load_weighted_mean_user_voltage_drop_pct", 0.0)),
+            5,
+        ),
+        "p95_user_voltage_drop_pct": round(float(priority.get("p95_user_voltage_drop_pct", 0.0)), 5),
         "max_total_voltage_drop_pct": round(float(power_flow.max_voltage_drop_pct), 5),
         "voltage_drop_penalty": diag.get("voltage_drop_penalty", 0.0),
         "worst_voltage_user_id": diag.get("worst_voltage_user_id"),
         "top_voltage_drop_users": top_users,
+    }
+
+
+def _path_constraints_summary(
+    *,
+    solution: EvaluatedSolution,
+    planning_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    diagnostics = solution.extra_metrics.get("path_diagnostics", {})
+    limit = float(planning_cfg.get("max_user_path_length_m", 300.0))
+    return {
+        "max_user_path_length_m": limit,
+        "hard_constraint_enabled": bool(planning_cfg.get("enforce_max_user_path_length", False)),
+        "max_actual_user_path_length_m": round(
+            float(diagnostics.get("max_actual_user_path_length_m", diagnostics.get("max_user_path_length_m", 0.0))),
+            3,
+        ),
+        "path_too_long_user_count": int(diagnostics.get("path_too_long_user_count", 0)),
+        "top_path_length_users": diagnostics.get("top_path_length_users", []),
     }
 
 

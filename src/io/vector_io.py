@@ -60,6 +60,7 @@ FEATURE_LAYER_DEFINITIONS: dict[str, tuple[str, dict[str, str]]] = {
             "transformer_id": "object",
             "candidate_id": "int64",
             "capacity_kva": "float64",
+            "capacity_source": "object",
             "fixed_cost": "float64",
             "elev_m": "float64",
             "ground_slope_deg": "float64",

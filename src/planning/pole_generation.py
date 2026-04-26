@@ -39,12 +39,14 @@ def generate_plan_layers(
         y=float(transformer_candidate.y),
         user_points=user_points,
     )
+    configured_capacity = planning_cfg.get("transformer_capacity_kva")
     transformer_layer = gpd.GeoDataFrame(
         [
             {
                 "transformer_id": "TX1",
                 "candidate_id": int(transformer_candidate.rank),
-                "capacity_kva": float(planning_cfg.get("transformer_capacity_kva", 630.0)),
+                "capacity_kva": float(configured_capacity) if configured_capacity is not None else 0.0,
+                "capacity_source": "recommended_after_optimization" if configured_capacity is None else "configured",
                 "fixed_cost": float(planning_cfg.get("transformer_fixed_cost", 120000.0)),
                 "elev_m": float(transformer_candidate.z),
                 "ground_slope_deg": float(sample_array(np.zeros_like(dtm), profile, transformer_candidate.x, transformer_candidate.y)),
@@ -89,8 +91,8 @@ def generate_plan_layers(
             "x": float(node.x),
             "y": float(node.y),
             "ground_z": float(node.z),
-            "pole_height_m": float(planning_cfg.get("lv_pole_height_m", 9.5)),
-            "support_top_z": float(node.z) + float(planning_cfg.get("lv_pole_height_m", 9.5)),
+            "pole_height_m": float(planning_cfg.get("lv_pole_height_m", 10.0)),
+            "support_top_z": float(node.z) + float(planning_cfg.get("lv_pole_height_m", 10.0)),
             "kind": "pole",
         }
         poles_rows.append(
@@ -98,7 +100,7 @@ def generate_plan_layers(
                 "pole_id": pole_id,
                 "candidate_id": next_pole_id - 1,
                 "pole_type": "lv_pole",
-                "pole_height_m": float(planning_cfg.get("lv_pole_height_m", 9.5)),
+                "pole_height_m": float(planning_cfg.get("lv_pole_height_m", 10.0)),
                 "fixed_cost": float(planning_cfg.get("pole_fixed_cost", 1800.0)),
                 "elev_m": float(node.z),
                 "ground_slope_deg": 0.0,
@@ -323,8 +325,8 @@ def _split_edge_supports(
             "x": float(x),
             "y": float(y),
             "ground_z": float(ground_z),
-            "pole_height_m": float(planning_cfg.get("lv_pole_height_m", 9.5)),
-            "support_top_z": float(ground_z) + float(planning_cfg.get("lv_pole_height_m", 9.5)),
+            "pole_height_m": float(planning_cfg.get("lv_pole_height_m", 10.0)),
+            "support_top_z": float(ground_z) + float(planning_cfg.get("lv_pole_height_m", 10.0)),
             "kind": "pole",
         }
         inserted.append(support)

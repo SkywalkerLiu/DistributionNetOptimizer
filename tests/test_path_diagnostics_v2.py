@@ -46,9 +46,10 @@ def optimized_plan():
 
 def test_path_diagnostics_are_reported(optimized_plan) -> None:
     assert "path_diagnostics" in optimized_plan.summary
+    assert "path_constraints" in optimized_plan.summary
     diagnostics = optimized_plan.summary["path_diagnostics"]
-    assert "max_user_path_length_m" in diagnostics
-    assert "top_long_user_paths" in diagnostics
+    assert "max_actual_user_path_length_m" in diagnostics
+    assert "top_path_length_users" in diagnostics
 
 
 def test_root_feeder_diagnostics_are_reported(optimized_plan) -> None:
@@ -146,7 +147,11 @@ def _planning_cfg() -> dict:
 
 def _config() -> dict:
     planning = {
-        "transformer_capacity_kva": 630.0,
+        "transformer_capacity_kva": None,
+        "transformer_capacity_enforced": False,
+        "demand_factor": 0.85,
+        "transformer_target_loading_ratio": 0.80,
+        "transformer_standard_capacities_kva": [100, 160, 200, 250, 315, 400, 500, 630, 800],
         "max_loading_ratio": 1.0,
         "transformer_fixed_cost": 100000.0,
         "pole_fixed_cost": 1000.0,
@@ -160,12 +165,13 @@ def _config() -> dict:
         "phase_balance_max_ratio": 0.25,
         "voltage_drop_max_pct": 20.0,
         "low_voltage_phase_v": 230.0,
-        "lv_ground_clearance_m": 2.5,
-        "service_ground_clearance_m": 2.0,
+        "lv_ground_clearance_m": 6.0,
+        "service_ground_clearance_m": 2.3,
         "clearance_sample_step_m": 2.0,
     }
     planning_v2 = {
         "enable_v2_optimizer": True,
+        "objective_mode": "voltage_first",
         "tx_candidate_count": 8,
         "tx_prefilter_top_k": 3,
         "corridor_safe_margin_m": 8.0,
@@ -174,20 +180,27 @@ def _config() -> dict:
         "corridor_neighbor_count": 12,
         "corridor_boundary_penalty_weight": 16.0,
         "build_cost_weight": 1.0,
+        "loss_kw_weight": 30000.0,
         "path_length_penalty_weight": 20.0,
         "max_user_path_length_m": 300.0,
+        "enforce_max_user_path_length": True,
         "max_user_path_penalty_weight": 1000.0,
         "load_weighted_path_penalty_weight": 1.0,
         "root_feeder_min_count": 3,
         "root_feeder_count_penalty_weight": 50000.0,
         "phase_unbalance_weight": 1.0,
         "tx_unbalance_weight": 1.0,
-        "segment_unbalance_weight": 0.5,
+        "segment_unbalance_weight": 2.0,
+        "phase_balance_hard_constraint": False,
         "max_service_drop_m": 25.0,
         "max_pole_span_m": 50.0,
         "pole_user_clearance_m": 5.0,
         "line_user_clearance_m": 1.0,
         "voltage_drop_max_pct": 20.0,
+        "voltage_priority_metric": "load_weighted_mean",
+        "voltage_drop_reference_pct": 7.0,
+        "voltage_drop_penalty_weight": 300000.0,
+        "voltage_drop_warning_pct": 10.0,
         "phase_balance_target_ratio": 0.15,
         "phase_balance_max_ratio": 0.25,
         "solver_backend": "highs",

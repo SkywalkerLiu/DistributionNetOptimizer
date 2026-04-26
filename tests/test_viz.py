@@ -261,7 +261,7 @@ def _preview_layers():
         {
             "pole_id": ["P0001", "P0002"],
             "pole_type": ["lv_pole", "lv_pole"],
-            "pole_height_m": [9.5, 9.5],
+            "pole_height_m": [10.0, 10.0],
             "elev_m": [22.0, 35.0],
         },
         geometry=[Point(20.0, 30.0), Point(55.0, 50.0)],

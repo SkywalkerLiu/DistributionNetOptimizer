@@ -15,6 +15,7 @@ def improve_attachment_choices(
     patience: int = 1,
     top_options: int = 5,
     max_full_evals: int = 0,
+    is_better: Callable[[EvaluatedSolution, EvaluatedSolution], bool] | None = None,
     performance_counters: dict[str, int] | None = None,
     progress_callback: Callable[[int, int, bool, EvaluatedSolution], None] | None = None,
 ) -> EvaluatedSolution:
@@ -28,6 +29,11 @@ def improve_attachment_choices(
     bounded_max_full_evals = max(0, int(max_full_evals))
     no_improve_count = 0
     full_eval_count = 0
+
+    def better(candidate: EvaluatedSolution, incumbent: EvaluatedSolution) -> bool:
+        if is_better is not None:
+            return is_better(candidate, incumbent)
+        return candidate.objective + 1e-9 < incumbent.objective
 
     for iteration in range(1, max_iter + 1):
         ranked_users = sorted(
@@ -68,7 +74,7 @@ def improve_attachment_choices(
                 _increment_counter(performance_counters, "local_search_full_eval_count", 1)
                 full_eval_count += 1
                 trial_solution = evaluate(trial_choices)
-                if trial_solution.objective + 1e-9 < best.objective:
+                if better(trial_solution, best):
                     best = trial_solution
                     choices = dict(trial_solution.attachment_choices)
                     improved = True

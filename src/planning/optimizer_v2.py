@@ -22,7 +22,7 @@ from src.planning.progress import OptimizationProgress
 from src.planning.radial_tree_milp import RadialTreeModelData, build_radial_tree_model_data, solve_radial_tree
 from src.planning.summary_v2 import build_summary_v2
 from src.planning.transformer_candidates import generate_transformer_candidates
-from src.planning.voltage_eval import evaluate_solution_feasibility, phase_unbalance_penalty
+from src.planning.voltage_eval import evaluate_solution_feasibility, phase_unbalance_penalty, phase_unbalance_ratio
 
 
 @dataclass(slots=True)
@@ -153,7 +153,7 @@ def optimize_distribution_network_v2(
     initial_results.sort(key=lambda item: item.candidate_index)
 
     local_search_top_k = max(0, min(int(planning_cfg.get("local_search_top_k", 8)), len(initial_results)))
-    ranked_for_search = sorted(initial_results, key=lambda item: (not item.solution.feasible, item.solution.objective))[
+    ranked_for_search = sorted(initial_results, key=lambda item: _solution_priority_key(item.solution))[
         :local_search_top_k
     ]
     search_started_at = time.perf_counter()
@@ -267,7 +267,7 @@ def _evaluate_initial_candidates(
                     )
             return results
         except (OSError, PermissionError, RuntimeError) as exc:
-            planning_cfg["parallel_fallback_reason"] = f"{type(exc).__name__}: {exc}"
+            planning_cfg["parallel_fallback_reason"] = _parallel_fallback_reason(exc)
             progress.stage(
                 progress=0.25,
                 label="候选评估",
@@ -345,7 +345,7 @@ def _improve_top_candidates(
                     )
             return results
         except (OSError, PermissionError, RuntimeError) as exc:
-            planning_cfg["parallel_fallback_reason"] = f"{type(exc).__name__}: {exc}"
+            planning_cfg["parallel_fallback_reason"] = _parallel_fallback_reason(exc)
             progress.stage(
                 progress=0.60,
                 label="候选评估",
@@ -452,6 +452,7 @@ def _improve_candidate_direct(
         patience=int(planning_cfg.get("local_search_patience", 8)),
         top_options=int(planning_cfg.get("local_search_top_options", 5)),
         max_full_evals=int(planning_cfg.get("local_search_max_full_evals", 200)),
+        is_better=lambda candidate, incumbent: _solution_priority_key(candidate) < _solution_priority_key(incumbent),
         performance_counters=counters,
         progress_callback=None
         if progress is None
@@ -510,6 +511,74 @@ def _improve_candidate_worker(initial_result: CandidateEvaluationResult) -> Cand
     )
 
 
+def _voltage_priority_metrics(
+    *,
+    power_flow: Any,
+    users: gpd.GeoDataFrame,
+) -> dict[str, float]:
+    """Compute user-level voltage-priority metrics."""
+
+    drops = []
+    weights = []
+    load_by_user = {
+        int(row.user_id): float(getattr(row, "apparent_kva", 0.0))
+        for row in users.itertuples()
+    }
+
+    for user_id, drop_pct in power_flow.user_voltage_drop_pct.items():
+        drops.append(float(drop_pct))
+        weights.append(max(load_by_user.get(int(user_id), 1.0), 1e-9))
+
+    if not drops:
+        return {
+            "mean_user_voltage_drop_pct": 0.0,
+            "load_weighted_mean_user_voltage_drop_pct": 0.0,
+            "p95_user_voltage_drop_pct": 0.0,
+            "max_user_voltage_drop_pct": 0.0,
+        }
+
+    drop_array = np.asarray(drops, dtype=float)
+    weight_array = np.asarray(weights, dtype=float)
+    return {
+        "mean_user_voltage_drop_pct": float(np.mean(drop_array)),
+        "load_weighted_mean_user_voltage_drop_pct": float(np.average(drop_array, weights=weight_array)),
+        "p95_user_voltage_drop_pct": float(np.percentile(drop_array, 95)),
+        "max_user_voltage_drop_pct": float(np.max(drop_array)),
+    }
+
+
+def _phase_balance_diagnostics(power_flow: Any) -> dict[str, float]:
+    edge_ratios = [
+        phase_unbalance_ratio(np.asarray(load, dtype=float))
+        for load in power_flow.edge_phase_loads.values()
+        if float(np.asarray(load, dtype=float).sum()) > 0.0
+    ]
+    return {
+        "transformer_unbalance_ratio": float(phase_unbalance_ratio(power_flow.transformer_phase_loads)),
+        "mean_shared_lv_line_unbalance_ratio": float(np.mean(edge_ratios)) if edge_ratios else 0.0,
+        "max_shared_lv_line_unbalance_ratio": float(np.max(edge_ratios)) if edge_ratios else 0.0,
+    }
+
+
+def _solution_priority_key(solution: EvaluatedSolution) -> tuple:
+    """Return the voltage-first solution ranking key."""
+
+    voltage = solution.extra_metrics.get("voltage_priority", {})
+    loss_diag = solution.extra_metrics.get("loss_diagnostics", {})
+    phase_diag = solution.extra_metrics.get("phase_balance_diagnostics", {})
+    return (
+        int(not solution.feasible),
+        float(voltage.get("load_weighted_mean_user_voltage_drop_pct", float("inf"))),
+        float(voltage.get("p95_user_voltage_drop_pct", float("inf"))),
+        float(voltage.get("max_user_voltage_drop_pct", float("inf"))),
+        float(solution.build_cost),
+        float(loss_diag.get("total_loss_kw", float("inf"))),
+        float(phase_diag.get("transformer_unbalance_ratio", float("inf"))),
+        float(phase_diag.get("mean_shared_lv_line_unbalance_ratio", float("inf"))),
+        float(solution.objective),
+    )
+
+
 def _select_final_solution_with_geometry_check(
     *,
     solutions: list[EvaluatedSolution],
@@ -523,7 +592,7 @@ def _select_final_solution_with_geometry_check(
 ) -> FinalGeometrySelection:
     """Generate final layers for top solutions and pick one that passes geometry checks."""
 
-    ranked = sorted(solutions, key=lambda item: (not item.feasible, item.objective))
+    ranked = sorted(solutions, key=_solution_priority_key)
     bounded_top_k = max(1, min(int(top_k), len(ranked)))
     checked: list[FinalGeometrySelection] = []
     first_solution = ranked[0]
@@ -639,18 +708,15 @@ def _annotate_geometry_check_summary(
     summary["selected_geometry_check_index"] = int(selected_geometry_check_index)
 
 
-def _geometry_fallback_key(selection: FinalGeometrySelection) -> tuple[int, int, int, int, int, float]:
+def _geometry_fallback_key(selection: FinalGeometrySelection) -> tuple:
     summary = selection.summary
-    reasons = summary.get("infeasible_reasons") or summary.get("infeasible_reason") or []
     line_violation_count = int(summary.get("line_totals", {}).get("violation_count", 0))
     pole_violation_count = int(summary.get("poles", {}).get("user_clearance_violation_count", 0))
     return (
         line_violation_count + pole_violation_count,
         line_violation_count,
         pole_violation_count,
-        int(not selection.solution.feasible),
-        len(reasons),
-        float(selection.solution.objective),
+        *_solution_priority_key(selection.solution),
     )
 
 
@@ -764,6 +830,10 @@ def _evaluate_candidate_solution(
         power_flow=power_flow,
         planning_cfg=planning_cfg,
     )
+    voltage_priority = _voltage_priority_metrics(
+        power_flow=power_flow,
+        users=users,
+    )
     voltage_ok, hard_constraint_diagnostics, hard_constraint_reasons = evaluate_solution_feasibility(
         users=users,
         power_flow=power_flow,
@@ -781,13 +851,16 @@ def _evaluate_candidate_solution(
     loss_kw = float(power_flow.total_loss_kw)
     loss_penalty = float(planning_cfg.get("loss_kw_weight", 10000.0)) * loss_kw
     unbalance_penalty = phase_unbalance_penalty(power_flow=power_flow, planning_cfg=planning_cfg)
-    path_penalty, path_diagnostics = _path_length_penalty(
+    phase_balance_diagnostics = _phase_balance_diagnostics(power_flow)
+    path_penalty, path_diagnostics, path_hard_diagnostics, path_hard_reasons = _path_length_penalty(
         tree=tree,
         choices=choices,
         corridor=corridor,
         users=users,
         planning_cfg=planning_cfg,
     )
+    diagnostics.extend(path_hard_diagnostics)
+    infeasible_reasons.extend(path_hard_reasons)
     root_feeder_penalty, root_feeder_diagnostics = _root_feeder_penalty(
         tree=tree,
         planning_cfg=planning_cfg,
@@ -819,10 +892,25 @@ def _evaluate_candidate_solution(
             "path_diagnostics": path_diagnostics,
             "root_feeder_diagnostics": root_feeder_diagnostics,
             "voltage_diagnostics": voltage_diagnostics,
+            "voltage_priority": voltage_priority,
             "loss_diagnostics": {
                 "total_loss_kw": round(float(loss_kw), 5),
                 "loss_kw_weight": round(float(planning_cfg.get("loss_kw_weight", 10000.0)), 5),
                 "loss_penalty": round(float(loss_penalty), 3),
+            },
+            "phase_balance_diagnostics": {
+                "transformer_unbalance_ratio": round(
+                    float(phase_balance_diagnostics["transformer_unbalance_ratio"]),
+                    5,
+                ),
+                "mean_shared_lv_line_unbalance_ratio": round(
+                    float(phase_balance_diagnostics["mean_shared_lv_line_unbalance_ratio"]),
+                    5,
+                ),
+                "max_shared_lv_line_unbalance_ratio": round(
+                    float(phase_balance_diagnostics["max_shared_lv_line_unbalance_ratio"]),
+                    5,
+                ),
             },
         },
     )
@@ -896,16 +984,19 @@ def _path_length_penalty(
     corridor: Any,
     users: Any,
     planning_cfg: dict[str, Any],
-) -> tuple[float, dict[str, Any]]:
+) -> tuple[float, dict[str, Any], list[str], list[str]]:
     """Return path-length penalty and diagnostics for one evaluated solution."""
 
     user_by_id = {int(row.user_id): row for row in users.itertuples()}
     max_user_path_length_m = float(planning_cfg.get("max_user_path_length_m", 300.0))
+    hard_constraint_enabled = bool(planning_cfg.get("enforce_max_user_path_length", False))
     path_weight = float(planning_cfg.get("path_length_penalty_weight", 20.0))
     max_path_weight = float(planning_cfg.get("max_user_path_penalty_weight", 1000.0))
     load_weight = float(planning_cfg.get("load_weighted_path_penalty_weight", 1.0))
 
     rows: list[dict[str, Any]] = []
+    hard_diagnostics: list[str] = []
+    hard_reasons: list[str] = []
     total_load_kva = 0.0
     load_weighted_path_sum = 0.0
     penalty = 0.0
@@ -913,23 +1004,29 @@ def _path_length_penalty(
     for user_id, option in choices.items():
         row = user_by_id[int(user_id)]
         load_kva = float(row.apparent_kva)
-        path_m = _user_path_length_m(tree=tree, option=option, corridor=corridor)
+        public_path_m = _user_path_length_m(tree=tree, option=option, corridor=corridor)
         service_m = float(option.length_3d_m)
-        total_m = path_m + service_m
+        total_m = public_path_m + service_m
 
         total_load_kva += load_kva
-        load_weighted_path_sum += load_kva * path_m
+        load_weighted_path_sum += load_kva * total_m
 
-        penalty += path_weight * load_weight * load_kva * path_m / 100.0
+        penalty += path_weight * load_weight * load_kva * total_m / 100.0
 
-        excess_m = max(0.0, path_m - max_user_path_length_m)
+        excess_m = max(0.0, total_m - max_user_path_length_m)
         if excess_m > 0.0:
             penalty += max_path_weight * (excess_m / 100.0) ** 2
+            if hard_constraint_enabled:
+                hard_diagnostics.append(
+                    f"User {int(user_id)} path length {total_m:.2f} m exceeds limit {max_user_path_length_m:.2f} m."
+                )
+                hard_reasons.append("user_path_too_long")
 
         rows.append(
             {
                 "user_id": int(user_id),
-                "path_length_m": float(path_m),
+                "path_length_m": float(total_m),
+                "public_lv_path_length_m": float(public_path_m),
                 "service_drop_length_m": float(service_m),
                 "total_path_plus_service_m": float(total_m),
                 "load_kva": float(load_kva),
@@ -945,14 +1042,26 @@ def _path_length_penalty(
 
     diagnostics = {
         "max_user_path_length_m": round(float(max_path), 3),
+        "max_actual_user_path_length_m": round(float(max_path), 3),
         "worst_path_user_id": worst_user_id,
         "load_weighted_average_path_length_m": round(float(load_weighted_avg), 3),
         "max_user_path_length_limit_m": round(float(max_user_path_length_m), 3),
+        "hard_constraint_enabled": bool(hard_constraint_enabled),
+        "path_too_long_user_count": int(sum(1 for item in rows if item["excess_path_m"] > 0.0)),
         "path_length_penalty": round(float(penalty), 3),
+        "top_path_length_users": [
+            {
+                "user_id": item["user_id"],
+                "path_length_m": round(float(item["path_length_m"]), 3),
+                "max_user_path_length_m": round(float(max_user_path_length_m), 3),
+            }
+            for item in rows[:10]
+        ],
         "top_long_user_paths": [
             {
                 "user_id": item["user_id"],
                 "path_length_m": round(float(item["path_length_m"]), 3),
+                "public_lv_path_length_m": round(float(item["public_lv_path_length_m"]), 3),
                 "service_drop_length_m": round(float(item["service_drop_length_m"]), 3),
                 "total_path_plus_service_m": round(float(item["total_path_plus_service_m"]), 3),
                 "load_kva": round(float(item["load_kva"]), 3),
@@ -962,7 +1071,7 @@ def _path_length_penalty(
             for item in rows[:10]
         ],
     }
-    return float(penalty), diagnostics
+    return float(penalty), diagnostics, hard_diagnostics, _dedupe_reasons(hard_reasons)
 
 
 def _root_feeder_penalty(
@@ -1052,6 +1161,7 @@ def _resolve_planning_v2_config(config: dict[str, Any]) -> dict[str, Any]:
 
     planning_defaults = {
         "enable_v2_optimizer": True,
+        "objective_mode": "voltage_first",
         "tx_candidate_count": 60,
         "tx_prefilter_top_k": 6,
         "corridor_safe_margin_m": 12.0,
@@ -1060,23 +1170,31 @@ def _resolve_planning_v2_config(config: dict[str, Any]) -> dict[str, Any]:
         "corridor_neighbor_count": 12,
         "corridor_boundary_penalty_weight": 20.0,
         "build_cost_weight": 1.0,
-        "loss_kw_weight": 10000.0,
+        "transformer_capacity_kva": None,
+        "transformer_capacity_enforced": False,
+        "demand_factor": 0.85,
+        "transformer_target_loading_ratio": 0.80,
+        "transformer_standard_capacities_kva": [100, 160, 200, 250, 315, 400, 500, 630, 800],
+        "loss_kw_weight": 30000.0,
         "path_length_penalty_weight": 20.0,
         "max_user_path_length_m": 300.0,
+        "enforce_max_user_path_length": True,
         "max_user_path_penalty_weight": 1000.0,
         "load_weighted_path_penalty_weight": 1.0,
         "root_feeder_min_count": 3,
         "root_feeder_count_penalty_weight": 50000.0,
         "phase_unbalance_weight": 3.0,
         "tx_unbalance_weight": 2.0,
-        "segment_unbalance_weight": 1.0,
+        "segment_unbalance_weight": 2.0,
+        "phase_balance_hard_constraint": False,
         "max_service_drop_m": 25.0,
         "max_pole_span_m": 50.0,
         "pole_user_clearance_m": 5.0,
         "line_user_clearance_m": 1.0,
         "voltage_drop_max_pct": 7.0,
+        "voltage_priority_metric": "load_weighted_mean",
         "voltage_drop_reference_pct": 7.0,
-        "voltage_drop_penalty_weight": 50000.0,
+        "voltage_drop_penalty_weight": 300000.0,
         "voltage_drop_warning_pct": 10.0,
         "voltage_drop_top_user_count": 10,
         "phase_balance_target_ratio": 0.10,
@@ -1132,6 +1250,16 @@ def _use_parallel(*, planning_cfg: dict[str, Any], worker_count: int) -> bool:
         and int(worker_count) > 1
         and "parallel_fallback_reason" not in planning_cfg
     )
+
+
+def _parallel_fallback_reason(exc: BaseException) -> str:
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return f"{type(exc).__name__}: winerror_{int(winerror)}"
+    errno = getattr(exc, "errno", None)
+    if errno is not None:
+        return f"{type(exc).__name__}: errno_{int(errno)}"
+    return type(exc).__name__
 
 
 def _build_performance_summary(

@@ -21,19 +21,21 @@ def evaluate_solution_feasibility(
 
     diagnostics: list[str] = []
     infeasible_reasons: list[str] = []
-    capacity_limit = float(planning_cfg.get("transformer_capacity_kva", 630.0)) * float(
-        planning_cfg.get("max_loading_ratio", 1.0)
-    )
-    transformer_load = float(power_flow.transformer_phase_loads.sum())
-    if transformer_load > capacity_limit + 1e-9:
-        diagnostics.append(
-            f"Transformer loading {transformer_load:.2f} kVA exceeds limit {capacity_limit:.2f} kVA."
-        )
-        infeasible_reasons.append("transformer_overloaded")
+    capacity_enforced = bool(planning_cfg.get("transformer_capacity_enforced", True))
+    capacity_value = planning_cfg.get("transformer_capacity_kva")
+    if capacity_enforced and capacity_value is not None:
+        capacity_limit = float(capacity_value) * float(planning_cfg.get("max_loading_ratio", 1.0))
+        transformer_load = float(power_flow.transformer_phase_loads.sum())
+        if transformer_load > capacity_limit + 1e-9:
+            diagnostics.append(
+                f"Transformer loading {transformer_load:.2f} kVA exceeds limit {capacity_limit:.2f} kVA."
+            )
+            infeasible_reasons.append("transformer_overloaded")
 
+    phase_balance_hard = bool(planning_cfg.get("phase_balance_hard_constraint", False))
     balance_limit = float(planning_cfg.get("phase_balance_max_ratio", 0.15))
     imbalance = phase_unbalance_ratio(power_flow.transformer_phase_loads)
-    if imbalance > balance_limit + 1e-9:
+    if phase_balance_hard and imbalance > balance_limit + 1e-9:
         diagnostics.append(
             f"Transformer phase imbalance {imbalance:.4f} exceeds limit {balance_limit:.4f}."
         )
