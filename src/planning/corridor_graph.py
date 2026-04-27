@@ -17,6 +17,7 @@ from src.planning.geometry_constraints import (
     segment_is_feasible,
 )
 from src.planning.models import CorridorEdge, CorridorGraph, CorridorNode
+from src.planning.service_grouping import ServiceGroup, _split_component_to_bounded_groups, build_service_groups
 
 
 def build_corridor_graph(
@@ -59,15 +60,31 @@ def build_corridor_graph(
     graph = nx.Graph()
     nodes: dict[str, CorridorNode] = {}
     node_by_cell: dict[tuple[int, int], str] = {}
-    kind_priority = {"junction": 0, "cluster": 1, "attach": 2}
+    kind_priority = {
+        "junction": 0,
+        "cluster": 1,
+        "attach": 2,
+        "service_group_attach": 3,
+    }
 
-    def add_node(*, row: int, col: int, kind: str, prefix: str) -> str:
+    def add_node(
+        *,
+        row: int,
+        col: int,
+        kind: str,
+        prefix: str,
+        service_group_id: str = "",
+    ) -> str:
         key = (int(row), int(col))
         if key in node_by_cell:
             existing_id = node_by_cell[key]
             existing = nodes[existing_id]
             if kind_priority.get(kind, 0) > kind_priority.get(existing.kind, 0):
                 existing.kind = kind
+                graph.nodes[existing_id]["kind"] = kind
+            if service_group_id and (not existing.service_group_id or kind == "service_group_attach"):
+                existing.service_group_id = service_group_id
+                graph.nodes[existing_id]["service_group_id"] = service_group_id
             return existing_id
         x, y = cell_to_xy(profile, row, col)
         node_id = f"{prefix}_{len(nodes) + 1:04d}"
@@ -79,10 +96,18 @@ def build_corridor_graph(
             row=int(row),
             col=int(col),
             kind=kind,
+            service_group_id=service_group_id,
         )
         nodes[node_id] = node
         node_by_cell[key] = node_id
-        graph.add_node(node_id, kind=kind, x=node.x, y=node.y, z=node.z)
+        graph.add_node(
+            node_id,
+            kind=kind,
+            x=node.x,
+            y=node.y,
+            z=node.z,
+            service_group_id=service_group_id,
+        )
         return node_id
 
     edge_max_length_m = float(planning_cfg.get("corridor_edge_max_length_m", 180.0))
@@ -106,16 +131,72 @@ def build_corridor_graph(
         if nearest is not None:
             add_node(row=nearest[0], col=nearest[1], kind="cluster", prefix="c")
 
-    for row in users.itertuples():
-        rr, cc = xy_to_cell(profile, float(row.geometry.x), float(row.geometry.y), shape=corridor_mask.shape)
-        nearest = nearest_passable_cell(
-            support_mask,
-            row=rr,
-            col=cc,
-            search_radius=max(2, int(math.ceil(float(planning_cfg.get("max_service_drop_m", 25.0)) / resolution))),
-        )
-        if nearest is not None:
-            add_node(row=nearest[0], col=nearest[1], kind="attach", prefix="a")
+    service_groups = _refine_groups_for_attach_feasibility(
+        groups=build_service_groups(
+            users=users,
+            planning_cfg=planning_cfg,
+        ),
+        users=users,
+        support_mask=support_mask,
+        profile=profile,
+        planning_cfg=planning_cfg,
+    )
+    service_group_by_user: dict[int, str] = {}
+    service_group_members: dict[str, list[int]] = {}
+    service_group_attach_node: dict[str, str] = {}
+
+    for group in service_groups:
+        service_group_members[group.group_id] = list(group.user_ids)
+        for user_id in group.user_ids:
+            service_group_by_user[int(user_id)] = group.group_id
+
+        if group.is_singleton:
+            user_id = int(group.user_ids[0])
+            user_point = user_points[user_id]
+            rr, cc = xy_to_cell(profile, float(user_point.x), float(user_point.y), shape=corridor_mask.shape)
+            nearest = nearest_passable_cell(
+                support_mask,
+                row=rr,
+                col=cc,
+                search_radius=max(
+                    2,
+                    int(math.ceil(float(planning_cfg.get("max_service_drop_m", 25.0)) / resolution)),
+                ),
+            )
+            if nearest is None:
+                raise ValueError(f"No feasible attach node was generated for singleton service group {group.group_id}.")
+            node_id = add_node(
+                row=nearest[0],
+                col=nearest[1],
+                kind="attach",
+                prefix="a",
+                service_group_id=group.group_id,
+            )
+        else:
+            attach_cell = _find_service_group_attach_cell(
+                group=group,
+                users=users,
+                support_mask=support_mask,
+                profile=profile,
+                max_service_drop_m=float(
+                    planning_cfg.get(
+                        "service_group_max_service_drop_m",
+                        planning_cfg.get("max_service_drop_m", 25.0),
+                    )
+                ),
+                pole_user_clearance_m=pole_user_clearance_m,
+                search_radius_m=float(planning_cfg.get("service_group_attach_search_radius_m", 35.0)),
+            )
+            if attach_cell is None:
+                raise ValueError(f"No feasible shared attach node was generated for service group {group.group_id}.")
+            node_id = add_node(
+                row=attach_cell[0],
+                col=attach_cell[1],
+                kind="service_group_attach",
+                prefix="sg",
+                service_group_id=group.group_id,
+            )
+        service_group_attach_node[group.group_id] = node_id
 
     node_ids = list(nodes)
     if not node_ids:
@@ -205,6 +286,9 @@ def build_corridor_graph(
         corridor_mask=allowed_mask.astype(np.uint8),
         boundary_distance_m=boundary_distance_m.astype(float),
         resolution_m=resolution,
+        service_group_by_user=service_group_by_user,
+        service_group_members=service_group_members,
+        service_group_attach_node=service_group_attach_node,
     )
 
 
@@ -391,6 +475,196 @@ def _support_mask_outside_users(
             if point_min_user_clearance(x=x, y=y, user_points=build_user_point_map(users)) + 1e-9 >= min_clearance_m:
                 filtered[int(row), int(col)] = True
     return filtered
+
+
+def _find_service_group_attach_cell(
+    *,
+    group: ServiceGroup,
+    users: Any,
+    support_mask: np.ndarray,
+    profile: dict[str, Any],
+    max_service_drop_m: float,
+    pole_user_clearance_m: float,
+    search_radius_m: float,
+) -> tuple[int, int] | None:
+    """Find the best feasible shared attach cell for one service group."""
+
+    resolution = abs(float(profile["transform"].a))
+    center_row, center_col = xy_to_cell(
+        profile,
+        float(group.centroid_x),
+        float(group.centroid_y),
+        shape=support_mask.shape,
+    )
+    search_radius_cells = max(1, int(math.ceil(float(search_radius_m) / max(resolution, 1e-9))))
+    xy_by_user = _xy_by_user(users)
+    group_points = [xy_by_user[int(user_id)] for user_id in group.user_ids if int(user_id) in xy_by_user]
+    all_points = list(xy_by_user.values())
+    if not group_points:
+        return None
+
+    best: tuple[float, int, int] | None = None
+    row_min = max(0, center_row - search_radius_cells)
+    row_max = min(support_mask.shape[0] - 1, center_row + search_radius_cells)
+    col_min = max(0, center_col - search_radius_cells)
+    col_max = min(support_mask.shape[1] - 1, center_col + search_radius_cells)
+
+    for row in range(row_min, row_max + 1):
+        for col in range(col_min, col_max + 1):
+            if not bool(support_mask[row, col]):
+                continue
+            x, y = cell_to_xy(profile, row, col)
+            distance_to_centroid = math.hypot(float(x) - float(group.centroid_x), float(y) - float(group.centroid_y))
+            if distance_to_centroid > float(search_radius_m) + resolution:
+                continue
+            group_distances = [math.hypot(float(x) - user_x, float(y) - user_y) for user_x, user_y in group_points]
+            if max(group_distances, default=float("inf")) > float(max_service_drop_m) + 1e-9:
+                continue
+            if any(
+                math.hypot(float(x) - user_x, float(y) - user_y) + 1e-9 < float(pole_user_clearance_m)
+                for user_x, user_y in all_points
+            ):
+                continue
+            score = (
+                max(group_distances) * 3.0
+                + float(np.mean(group_distances))
+                + distance_to_centroid * 0.5
+            )
+            candidate = (float(score), int(row), int(col))
+            if best is None or candidate < best:
+                best = candidate
+
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def _refine_groups_for_attach_feasibility(
+    *,
+    groups: list[ServiceGroup],
+    users: Any,
+    support_mask: np.ndarray,
+    profile: dict[str, Any],
+    planning_cfg: dict[str, Any],
+) -> list[ServiceGroup]:
+    """Split service groups until every multi-user group has a feasible shared attach cell."""
+
+    xy_by_user = _xy_by_user(users)
+    max_users = max(1, int(planning_cfg.get("service_group_max_users", 8)))
+    max_diameter_m = float(planning_cfg.get("service_group_max_diameter_m", 20.0))
+    max_service_drop_m = float(
+        planning_cfg.get(
+            "service_group_max_service_drop_m",
+            planning_cfg.get("max_service_drop_m", 25.0),
+        )
+    )
+    pole_user_clearance_m = float(planning_cfg.get("pole_user_clearance_m", 5.0))
+    search_radius_m = float(planning_cfg.get("service_group_attach_search_radius_m", 35.0))
+
+    pending = [list(group.user_ids) for group in groups]
+    accepted: list[list[int]] = []
+    while pending:
+        user_ids = sorted((int(user_id) for user_id in pending.pop(0)), key=lambda item: _user_sort_key(item, xy_by_user))
+        if len(user_ids) <= 1:
+            accepted.append(user_ids)
+            continue
+
+        group = _service_group_from_user_ids(
+            group_id="pending",
+            user_ids=user_ids,
+            xy_by_user=xy_by_user,
+        )
+        attach_cell = _find_service_group_attach_cell(
+            group=group,
+            users=users,
+            support_mask=support_mask,
+            profile=profile,
+            max_service_drop_m=max_service_drop_m,
+            pole_user_clearance_m=pole_user_clearance_m,
+            search_radius_m=search_radius_m,
+        )
+        if attach_cell is not None:
+            accepted.append(user_ids)
+            continue
+
+        forced_max_users = max(1, min(max_users, int(math.ceil(len(user_ids) / 2.0))))
+        if forced_max_users >= len(user_ids):
+            forced_max_users = len(user_ids) - 1
+        split_groups = _split_component_to_bounded_groups(
+            user_ids=user_ids,
+            xy_by_user=xy_by_user,
+            max_users=forced_max_users,
+            max_diameter_m=max_diameter_m,
+        )
+        if len(split_groups) <= 1 and len(split_groups[0]) == len(user_ids):
+            split_groups = [[user_id] for user_id in user_ids]
+        pending = [*split_groups, *pending]
+
+    accepted.sort(key=lambda group: _group_sort_key(group, xy_by_user))
+    return [
+        _service_group_from_user_ids(
+            group_id=f"sg_{index:04d}",
+            user_ids=user_ids,
+            xy_by_user=xy_by_user,
+        )
+        for index, user_ids in enumerate(accepted, start=1)
+    ]
+
+
+def _xy_by_user(users: Any) -> dict[int, tuple[float, float]]:
+    xy_by_user: dict[int, tuple[float, float]] = {}
+    if users is None:
+        return xy_by_user
+    for row in users.itertuples():
+        geometry = getattr(row, "geometry", None)
+        if geometry is None or geometry.is_empty:
+            continue
+        xy_by_user[int(row.user_id)] = (float(geometry.x), float(geometry.y))
+    return xy_by_user
+
+
+def _service_group_from_user_ids(
+    *,
+    group_id: str,
+    user_ids: list[int],
+    xy_by_user: dict[int, tuple[float, float]],
+) -> ServiceGroup:
+    sorted_user_ids = sorted((int(user_id) for user_id in user_ids), key=lambda item: _user_sort_key(item, xy_by_user))
+    xs = [xy_by_user[user_id][0] for user_id in sorted_user_ids]
+    ys = [xy_by_user[user_id][1] for user_id in sorted_user_ids]
+    return ServiceGroup(
+        group_id=group_id,
+        user_ids=sorted_user_ids,
+        centroid_x=float(np.mean(xs)),
+        centroid_y=float(np.mean(ys)),
+        max_pairwise_distance_m=_max_pairwise_distance(user_ids=sorted_user_ids, xy_by_user=xy_by_user),
+        is_singleton=len(sorted_user_ids) <= 1,
+    )
+
+
+def _max_pairwise_distance(
+    *,
+    user_ids: list[int],
+    xy_by_user: dict[int, tuple[float, float]],
+) -> float:
+    max_distance = 0.0
+    for left_index, left in enumerate(user_ids[:-1]):
+        left_x, left_y = xy_by_user[int(left)]
+        for right in user_ids[left_index + 1 :]:
+            right_x, right_y = xy_by_user[int(right)]
+            max_distance = max(max_distance, math.hypot(left_x - right_x, left_y - right_y))
+    return float(max_distance)
+
+
+def _user_sort_key(user_id: int, xy_by_user: dict[int, tuple[float, float]]) -> tuple[float, float, int]:
+    x, y = xy_by_user[int(user_id)]
+    return (float(x), float(y), int(user_id))
+
+
+def _group_sort_key(group: list[int], xy_by_user: dict[int, tuple[float, float]]) -> tuple[float, float, int]:
+    first = sorted(group, key=lambda user_id: _user_sort_key(user_id, xy_by_user))[0]
+    x, y = xy_by_user[int(first)]
+    return (float(x), float(y), int(first))
 
 
 def _kmeans_centers(*, points: np.ndarray, count: int, seed: int) -> np.ndarray:

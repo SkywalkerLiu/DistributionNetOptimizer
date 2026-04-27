@@ -74,6 +74,10 @@ def build_summary_v2(
                 float(solution.extra_metrics.get("voltage_diagnostics", {}).get("voltage_drop_penalty", 0.0)),
                 3,
             ),
+            "service_group_extra_attach_penalty": round(
+                float(solution.extra_metrics.get("service_group_diagnostics", {}).get("extra_attach_penalty", 0.0)),
+                3,
+            ),
         },
         "corridor": {
             "node_count": int(len(corridor.nodes)),
@@ -127,6 +131,10 @@ def build_summary_v2(
             "loss_penalty": round(float(solution.loss_cost), 3),
         },
         "voltage": _voltage_summary(solution=solution, planning_cfg=planning_cfg),
+        "service_grouping": _service_grouping_summary(
+            corridor=corridor,
+            solution=solution,
+        ),
         "path_constraints": _path_constraints_summary(solution=solution, planning_cfg=planning_cfg),
         "max_current_line": _max_current_line_summary(corridor=corridor, solution=solution),
         "path_diagnostics": solution.extra_metrics.get("path_diagnostics", {}),
@@ -135,6 +143,52 @@ def build_summary_v2(
             "count": int(len(users)),
             "connected_count": int(users["connected_node_id"].astype(str).ne("").sum()) if "connected_node_id" in users.columns else 0,
         },
+    }
+
+
+def _service_grouping_summary(
+    *,
+    corridor: CorridorGraph,
+    solution: EvaluatedSolution,
+) -> dict[str, Any]:
+    group_members = corridor.service_group_members
+    group_to_attach_nodes: dict[str, set[str]] = {}
+
+    for user_id, option in solution.attachment_choices.items():
+        group_id = corridor.service_group_by_user.get(int(user_id), "")
+        if not group_id:
+            continue
+        group_to_attach_nodes.setdefault(group_id, set()).add(str(option.attach_node_id))
+
+    multi_user_groups = {
+        group_id: users
+        for group_id, users in group_members.items()
+        if len(users) > 1
+    }
+    groups_with_multiple = {
+        group_id: sorted(nodes)
+        for group_id, nodes in group_to_attach_nodes.items()
+        if len(nodes) > 1
+    }
+
+    return {
+        "enabled": True,
+        "group_count": int(len(group_members)),
+        "multi_user_group_count": int(len(multi_user_groups)),
+        "singleton_group_count": int(len(group_members) - len(multi_user_groups)),
+        "max_group_size": int(max((len(users) for users in group_members.values()), default=0)),
+        "shared_attach_group_count": int(
+            sum(
+                1
+                for group_id, nodes in group_to_attach_nodes.items()
+                if len(nodes) == 1 and len(group_members.get(group_id, [])) > 1
+            )
+        ),
+        "groups_with_multiple_attach_nodes": groups_with_multiple,
+        "max_attach_nodes_per_group": int(max((len(nodes) for nodes in group_to_attach_nodes.values()), default=0)),
+        "extra_attach_penalty": float(
+            solution.extra_metrics.get("service_group_diagnostics", {}).get("extra_attach_penalty", 0.0)
+        ),
     }
 
 

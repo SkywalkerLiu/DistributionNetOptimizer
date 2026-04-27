@@ -35,6 +35,7 @@ class CorridorNode:
     row: int
     col: int
     kind: str
+    service_group_id: str = ""
 
 
 @dataclass(slots=True)
@@ -66,6 +67,9 @@ class CorridorGraph:
     corridor_mask: np.ndarray
     boundary_distance_m: np.ndarray
     resolution_m: float
+    service_group_by_user: dict[int, str] = field(default_factory=dict)
+    service_group_members: dict[str, list[int]] = field(default_factory=dict)
+    service_group_attach_node: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

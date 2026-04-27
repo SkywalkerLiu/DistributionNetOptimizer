@@ -1,18 +1,40 @@
 # DistributionNetOptimizer
 
-DistributionNetOptimizer 用于生成配电网规划前期的地形场景，并在此基础上进行低压配电网优化。当前默认场景为 400m x 600m、50 户用户，采用 `clustered_with_scattered` 用户分布，并区分普通用户与大功率用户负荷。
+DistributionNetOptimizer 用于生成配电网规划前期的地形场景，并在此基础上进行低压配电网优化。默认场景为 400m x 600m、50 户用户，支持居民簇与散户混合分布、地形约束、禁建区、三相分配、电压评估、杆塔派生和推荐配变容量。
 
 ## V2 优化器
 
-当前 V2 优化器采用 voltage-first 规划逻辑：先基于候选走廊图构建径向低压网络，再进行三相分配和功率流评估。候选方案排序优先比较用户整体压降，其次比较建设成本，再比较线损和三相平衡。
+V2 优化器采用 voltage-first 规划逻辑：候选方案排序优先比较用户整体压降，其次比较建设成本，再比较线损和三相平衡。
 
 架构链路：
 
 ```text
-候选走廊图 -> 径向树选边 -> 三相分配 -> 功率流评估 -> 电压优先排序 -> 杆塔派生与几何复核 -> 推荐配变容量
+候选走廊图 -> 自动 service group 识别 -> 共享接户杆候选生成 -> 径向树选边 -> 三相分配 -> 功率流评估 -> 电压优先排序 -> 杆塔派生与几何复核 -> 推荐配变容量
 ```
 
-V2 默认不在优化前固定配变容量。算法先完成网络规划，再根据最终接入负荷、需用系数和目标负载率，从标准容量序列中推荐配变容量。
+V2 优化器会根据用户点空间分布自动识别 service group，用于判断哪些用户可以共用一根接户杆。该机制只依赖用户坐标、接户线长度、杆位可建设性和净距约束，不依赖模拟数据中的 `cluster_id` 或 `settlement_type`。因此，真实台区用户点数据无需预先标注 cluster，也可以自动生成共享接户杆方案。
+
+每个 service group 生成共享接入候选点，散户作为单户 service group 处理。组内用户通过各自的 `service_drop` 接入同一根共享接户杆；若初始组过大或无法满足接户距离、净距和可建设性约束，优化器会在 service grouping 内部继续拆分，而不是回退到逐户 attach 建模。
+
+注意：`cluster_id` 是随机场景生成阶段用于展示和调试的可选字段，不参与 V2 优化器的 service grouping 逻辑。优化器运行时会重新根据用户坐标生成 `service_group_id`。
+
+## 默认配置
+
+默认配置文件见 [configs/default_config.yaml](configs/default_config.yaml)。
+
+```yaml
+planning_v2:
+  service_grouping_enabled: true
+  service_group_neighbor_radius_m: 12.0
+  service_group_min_users: 2
+  service_group_max_users: 8
+  service_group_max_diameter_m: 20.0
+  service_group_max_service_drop_m: 25.0
+  service_group_attach_search_radius_m: 35.0
+  service_group_extra_attach_penalty: 200000.0
+```
+
+配变容量默认不在优化前固定。算法先完成网络规划，再根据最终接入负荷、需用系数和目标负载率，从标准容量序列中推荐配变容量。
 
 ```yaml
 planning:
@@ -20,7 +42,6 @@ planning:
   transformer_capacity_enforced: false
   demand_factor: 0.85
   transformer_target_loading_ratio: 0.80
-  transformer_standard_capacities_kva: [100, 160, 200, 250, 315, 400, 500, 630, 800]
 ```
 
 用户到配变的低压供电路径按“公共低压线路路径长度 + 接户线长度”计算：
@@ -31,32 +52,7 @@ planning_v2:
   enforce_max_user_path_length: true
 ```
 
-当总路径长度超过 `max_user_path_length_m` 且 `enforce_max_user_path_length=true` 时，该方案判定为不可行，并输出 `user_path_too_long`。
-
-公共低压主干/分支线路默认采用 `lv_ground_clearance_m=6.0m`。接户线仍由 `service_ground_clearance_m` 单独控制。默认低压杆塔高度为 `lv_pole_height_m=10.0m`。
-
-## 默认场景
-
-默认配置文件为 [configs/default_config.yaml](configs/default_config.yaml)。
-
-```yaml
-scene:
-  width_m: 400
-  height_m: 600
-  max_elevation_m: 100
-  resolution_m: 1
-  origin_x_m: 0
-  origin_y_m: 600
-  crs: EPSG:3857
-  seed: 66
-```
-
-用户配置：
-
-- 普通住户：40 户，7.0 kW，功率因数 0.85，单相。
-- 大功率用户：10 户，10.0 kW，功率因数 0.85，单相。
-- 45 户位于居民簇内，5 户为散户。
-- 每个居民簇 3-8 户，簇内直径不超过 10m。
+公共低压主干/分支线路默认采用 `lv_ground_clearance_m=6.0m`。接户线由 `service_ground_clearance_m` 单独控制。默认低压杆塔高度为 `lv_pole_height_m=10.0m`。
 
 ## 常用命令
 
@@ -99,9 +95,23 @@ data/outputs/plans/optimization_summary.json
 data/outputs/plots/optimized_plan_2d.png
 data/outputs/plots/optimized_plan_3d_static.png
 data/outputs/plots/optimized_plan_3d_dynamic.html
+data/vector/features.gpkg
 ```
 
-`terrain_3d_preview.html` 只展示地形、用户、森林、水域和人工禁建区；`optimized_plan_3d_dynamic.html` 展示优化后的线路、杆塔、配变和用户接入结果。
+`optimization_summary.json` 中新增 `service_grouping` 字段，包含：
+
+- `group_count`
+- `multi_user_group_count`
+- `singleton_group_count`
+- `max_group_size`
+- `shared_attach_group_count`
+- `groups_with_multiple_attach_nodes`
+- `max_attach_nodes_per_group`
+- `extra_attach_penalty`
+
+`users` 图层会输出 `service_group_id`、`service_group_size` 和 `is_service_singleton`。
+
+`candidate_poles` 图层中，共享接户杆会标记为 `pole_type=shared_service_pole`，并输出 `service_group_id` 和 `served_user_count`。
 
 ## Summary 字段
 
@@ -137,11 +147,19 @@ data/outputs/plots/optimized_plan_3d_dynamic.html
 
 ## 测试
 
+轻量相关测试：
+
+```bash
+python -m pytest -q tests/test_service_grouping.py tests/test_optimizer.py
+```
+
+完整测试：
+
 ```bash
 python -m pytest -q
 ```
 
-当前重点覆盖：场景生成、V2 voltage-first 排序、配变容量后置推荐、300m 用户路径硬约束、6m 公共低压线路净空、10m 杆塔高度、线损输出和三相平衡软目标。
+当前重点覆盖：自动 service grouping、共享接户杆、V2 voltage-first 排序、配变容量后置推荐、300m 用户路径硬约束、6m 公共低压线路净空、10m 杆塔高度、线损输出和三相平衡软目标。
 
 ## 说明
 

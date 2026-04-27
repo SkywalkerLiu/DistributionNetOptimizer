@@ -39,8 +39,8 @@ class OptimizationProgress:
         overall = 0.25 + 0.65 * candidate_progress
         self._render(
             progress=overall,
-            label="候选评估",
-            detail=f"候选 {index}/{total} 准备评估{self._join_detail(detail)}",
+            label="Candidate evaluation",
+            detail=f"candidate {index}/{total} preparing{self._join_detail(detail)}",
         )
 
     def candidate_initial(
@@ -59,9 +59,9 @@ class OptimizationProgress:
         overall = 0.25 + 0.65 * candidate_progress
         self._render(
             progress=overall,
-            label="候选评估",
+            label="Candidate evaluation",
             detail=(
-                f"候选 {index}/{total} 初始解 | obj={objective:.1f} | "
+                f"candidate {index}/{total} initial solve | obj={objective:.1f} | "
                 f"{'feasible' if feasible else 'infeasible'}{self._global_best_suffix()}"
             ),
         )
@@ -86,9 +86,9 @@ class OptimizationProgress:
         overall = 0.25 + 0.65 * candidate_progress
         self._render(
             progress=overall,
-            label="候选评估",
+            label="Candidate evaluation",
             detail=(
-                f"候选 {index}/{total} 局部搜索 {bounded_iteration}/{bounded_max_iter} | "
+                f"candidate {index}/{total} local search {bounded_iteration}/{bounded_max_iter} | "
                 f"{'improved' if improved else 'no-improve'} | obj={objective:.1f}{self._global_best_suffix()}"
             ),
         )
@@ -108,9 +108,9 @@ class OptimizationProgress:
         overall = 0.25 + 0.65 * candidate_progress
         self._render(
             progress=overall,
-            label="候选评估",
+            label="Candidate evaluation",
             detail=(
-                f"候选 {index}/{total} 完成 | obj={objective:.1f} | "
+                f"candidate {index}/{total} finished | obj={objective:.1f} | "
                 f"{'feasible' if feasible else 'infeasible'}{self._global_best_suffix()}"
             ),
         )
@@ -118,7 +118,7 @@ class OptimizationProgress:
     def finish(self, *, detail: str = "") -> None:
         """Render the final completion state and terminate the line."""
 
-        self._render(progress=1.0, label="完成", detail=detail)
+        self._render(progress=1.0, label="Done", detail=detail)
         if self.enabled and not self._closed:
             self.stream.write("\n")
             self.stream.flush()
@@ -142,7 +142,7 @@ class OptimizationProgress:
         filled = min(filled, self.bar_width)
         bar = "#" * filled + "-" * (self.bar_width - filled)
         elapsed_s = time.perf_counter() - self._start_time
-        text = f"\r优化进度 [{bar}] {bounded * 100:6.2f}% | {label}"
+        text = f"\rOptimization progress [{bar}] {bounded * 100:6.2f}% | {label}"
         if detail:
             text += f" | {detail}"
         text += f" | {elapsed_s:6.1f}s"

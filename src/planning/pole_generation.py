@@ -84,6 +84,7 @@ def generate_plan_layers(
         node = corridor.nodes[node_id]
         pole_id = f"P{next_pole_id:04d}"
         next_pole_id += 1
+        pole_type = "shared_service_pole" if node.kind == "service_group_attach" else "lv_pole"
         user_clearance = point_min_user_clearance(x=float(node.x), y=float(node.y), user_points=user_points)
         public_node_id[node_id] = pole_id
         support_registry[pole_id] = {
@@ -99,12 +100,14 @@ def generate_plan_layers(
             {
                 "pole_id": pole_id,
                 "candidate_id": next_pole_id - 1,
-                "pole_type": "lv_pole",
+                "pole_type": pole_type,
                 "pole_height_m": float(planning_cfg.get("lv_pole_height_m", 10.0)),
                 "fixed_cost": float(planning_cfg.get("pole_fixed_cost", 1800.0)),
                 "elev_m": float(node.z),
                 "ground_slope_deg": 0.0,
                 "source": node.kind,
+                "service_group_id": node.service_group_id,
+                "served_user_count": _served_user_count_for_node(corridor=corridor, node_id=node_id),
                 "user_clearance_m": finite_clearance_value(user_clearance),
                 "required_user_clearance_m": pole_user_clearance_m,
                 "is_violation": int(user_clearance + 1e-9 < pole_user_clearance_m),
@@ -152,6 +155,8 @@ def generate_plan_layers(
                     "elev_m": float(support["ground_z"]),
                     "ground_slope_deg": 0.0,
                     "source": "span_split",
+                    "service_group_id": "",
+                    "served_user_count": 0,
                     "user_clearance_m": finite_clearance_value(user_clearance),
                     "required_user_clearance_m": pole_user_clearance_m,
                     "is_violation": int(user_clearance + 1e-9 < pole_user_clearance_m),
@@ -242,7 +247,13 @@ def generate_plan_layers(
         )
         required_clearance = float(planning_cfg.get("service_ground_clearance_m", 2.3))
         line = LineString([(float(attach_support["x"]), float(attach_support["y"])), (float(row.geometry.x), float(row.geometry.y))])
-        user_clearance = line_min_user_clearance(line=line, user_points=user_points, exclude_user_id=user_id)
+        group_id = corridor.service_group_by_user.get(user_id, "")
+        same_group_users = set(corridor.service_group_members.get(group_id, [user_id]))
+        user_clearance = line_min_user_clearance(
+            line=line,
+            user_points=user_points,
+            exclude_user_ids=same_group_users,
+        )
         violation_reasons = _line_violation_reasons(
             vertical_clearance=clearance,
             required_vertical_clearance=required_clearance,
@@ -284,6 +295,18 @@ def generate_plan_layers(
     poles_layer = gpd.GeoDataFrame(poles_rows, geometry=pole_geometries, crs=crs)
     planned_lines = gpd.GeoDataFrame(planned_line_rows, geometry=planned_line_geometries, crs=crs)
     return transformer_layer, poles_layer, planned_lines, user_connection_public
+
+
+def _served_user_count_for_node(*, corridor: CorridorGraph, node_id: str) -> int:
+    """Return users served by service groups mapped to one corridor attach node."""
+
+    return int(
+        sum(
+            len(corridor.service_group_members.get(group_id, []))
+            for group_id, attach_node_id in corridor.service_group_attach_node.items()
+            if str(attach_node_id) == str(node_id)
+        )
+    )
 
 
 def _split_edge_supports(

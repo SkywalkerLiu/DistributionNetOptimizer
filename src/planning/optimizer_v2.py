@@ -82,8 +82,8 @@ def optimize_distribution_network_v2(
     )
     progress.stage(
         progress=0.02,
-        label="准备输入",
-        detail=f"用户 {len(users)} | 栅格 {dtm.shape[1]}x{dtm.shape[0]}",
+        label="Prepare inputs",
+        detail=f"users={len(users)} | grid={dtm.shape[1]}x{dtm.shape[0]}",
     )
     corridor_started_at = time.perf_counter()
     corridor = build_corridor_graph(
@@ -100,8 +100,8 @@ def optimize_distribution_network_v2(
     corridor_duration_s = time.perf_counter() - corridor_started_at
     progress.stage(
         progress=0.15,
-        label="构建候选走廊图",
-        detail=f"节点 {len(corridor.nodes)} | 边 {len(corridor.edges)}",
+        label="Build corridor graph",
+        detail=f"nodes={len(corridor.nodes)} | edges={len(corridor.edges)}",
     )
     prefilter_started_at = time.perf_counter()
     transformer_candidates = generate_transformer_candidates(
@@ -113,8 +113,8 @@ def optimize_distribution_network_v2(
     )
     progress.stage(
         progress=0.20,
-        label="配变候选预筛",
-        detail=f"保留 {len(transformer_candidates)} 个候选点",
+        label="Prefilter transformers",
+        detail=f"kept={len(transformer_candidates)} candidates",
     )
     attachment_options = build_attachment_options(
         corridor=corridor,
@@ -126,8 +126,8 @@ def optimize_distribution_network_v2(
     prefilter_duration_s = time.perf_counter() - prefilter_started_at
     progress.stage(
         progress=0.25,
-        label="构建接入候选",
-        detail=f"用户 {len(attachment_options)} | 初始接入完成",
+        label="Build attachments",
+        detail=f"users={len(attachment_options)} | initial attachments ready",
     )
 
     candidate_pool = transformer_candidates[: max(1, int(planning_cfg.get("candidate_solution_pool_size", 10)))]
@@ -176,7 +176,7 @@ def optimize_distribution_network_v2(
         raise ValueError("The V2 optimizer could not generate any candidate solutions.")
     progress.stage(
         progress=0.96,
-        label="输出复核",
+        label="Final geometry check",
         detail="geometry check and summary",
     )
     output_started_at = time.perf_counter()
@@ -259,9 +259,9 @@ def _evaluate_initial_candidates(
                     results.append(result)
                     progress.stage(
                         progress=0.25 + 0.35 * completed / max(total, 1),
-                        label="候选评估",
+                        label="Candidate evaluation",
                         detail=(
-                            f"初始候选并行评估 {completed}/{total} | workers={worker_count} | "
+                            f"parallel initial {completed}/{total} | workers={worker_count} | "
                             f"rank={result.solution.transformer_candidate.rank} | obj={result.solution.objective:.1f}"
                         ),
                     )
@@ -270,8 +270,8 @@ def _evaluate_initial_candidates(
             planning_cfg["parallel_fallback_reason"] = _parallel_fallback_reason(exc)
             progress.stage(
                 progress=0.25,
-                label="候选评估",
-                detail="并行评估不可用，已自动回退串行",
+                label="Candidate evaluation",
+                detail="parallel evaluation unavailable; using serial fallback",
             )
 
     results: list[CandidateEvaluationResult] = []
@@ -337,10 +337,10 @@ def _improve_top_candidates(
                     results.append(result)
                     progress.stage(
                         progress=0.60 + 0.30 * completed / max(total, 1),
-                        label="候选评估",
+                        label="Candidate evaluation",
                         detail=(
-                            f"局部搜索并行评估 {completed}/{total} | workers={min(worker_count, total)} | "
-                            f"候选 {result.candidate_index} | obj={result.solution.objective:.1f}"
+                            f"parallel local search {completed}/{total} | workers={min(worker_count, total)} | "
+                            f"candidate {result.candidate_index} | obj={result.solution.objective:.1f}"
                         ),
                     )
             return results
@@ -348,8 +348,8 @@ def _improve_top_candidates(
             planning_cfg["parallel_fallback_reason"] = _parallel_fallback_reason(exc)
             progress.stage(
                 progress=0.60,
-                label="候选评估",
-                detail="局部搜索并行不可用，已自动回退串行",
+                label="Candidate evaluation",
+                detail="parallel local search unavailable; using serial fallback",
             )
 
     results = []
@@ -654,6 +654,7 @@ def _build_geometry_selection(
         users=users,
         solution=solution,
         user_connection_public=user_connection_public,
+        corridor=corridor,
     )
     summary = build_summary_v2(
         corridor=corridor,
@@ -680,6 +681,7 @@ def _annotate_users_for_solution(
     users: gpd.GeoDataFrame,
     solution: EvaluatedSolution,
     user_connection_public: dict[int, str],
+    corridor: Any,
 ) -> gpd.GeoDataFrame:
     annotated = users.copy()
     annotated["assigned_phase"] = annotated["user_id"].map(
@@ -690,6 +692,15 @@ def _annotate_users_for_solution(
     )
     annotated["voltage_drop_pct"] = annotated["user_id"].map(
         lambda value: solution.power_flow.user_voltage_drop_pct.get(int(value), 0.0)
+    )
+    annotated["service_group_id"] = annotated["user_id"].map(
+        lambda value: corridor.service_group_by_user.get(int(value), "")
+    )
+    annotated["service_group_size"] = annotated["service_group_id"].map(
+        lambda group_id: len(corridor.service_group_members.get(str(group_id), []))
+    )
+    annotated["is_service_singleton"] = annotated["service_group_size"].map(
+        lambda size: int(size <= 1)
     )
     return annotated
 
@@ -865,12 +876,18 @@ def _evaluate_candidate_solution(
         tree=tree,
         planning_cfg=planning_cfg,
     )
+    service_group_penalty, service_group_diagnostics = _service_group_attach_penalty(
+        choices=choices,
+        corridor=corridor,
+        planning_cfg=planning_cfg,
+    )
     objective = (
         float(planning_cfg.get("build_cost_weight", 1.0)) * build_cost
         + loss_penalty
         + unbalance_penalty
         + path_penalty
         + root_feeder_penalty
+        + service_group_penalty
         + voltage_penalty
         + 1_000_000.0 * len(diagnostics)
     )
@@ -891,6 +908,7 @@ def _evaluate_candidate_solution(
         extra_metrics={
             "path_diagnostics": path_diagnostics,
             "root_feeder_diagnostics": root_feeder_diagnostics,
+            "service_group_diagnostics": service_group_diagnostics,
             "voltage_diagnostics": voltage_diagnostics,
             "voltage_priority": voltage_priority,
             "loss_diagnostics": {
@@ -1097,6 +1115,40 @@ def _root_feeder_penalty(
     return float(penalty), diagnostics
 
 
+def _service_group_attach_penalty(
+    *,
+    choices: dict[int, Any],
+    corridor: Any,
+    planning_cfg: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    """Penalize any service group whose users were assigned to multiple attach nodes."""
+
+    group_to_attach_nodes: dict[str, set[str]] = {}
+    for user_id, option in choices.items():
+        group_id = corridor.service_group_by_user.get(int(user_id), "")
+        if not group_id:
+            continue
+        group_to_attach_nodes.setdefault(group_id, set()).add(str(option.attach_node_id))
+
+    groups_with_multiple = {
+        group_id: sorted(nodes)
+        for group_id, nodes in group_to_attach_nodes.items()
+        if len(nodes) > 1
+    }
+    penalty = sum(
+        (len(nodes) - 1)
+        * float(planning_cfg.get("service_group_extra_attach_penalty", 200000.0))
+        for nodes in groups_with_multiple.values()
+    )
+
+    return float(penalty), {
+        "group_count": len(group_to_attach_nodes),
+        "groups_with_multiple_attach_nodes": groups_with_multiple,
+        "max_attach_nodes_per_group": max((len(nodes) for nodes in group_to_attach_nodes.values()), default=0),
+        "extra_attach_penalty": round(float(penalty), 3),
+    }
+
+
 def _estimate_build_cost(
     *,
     tree: Any,
@@ -1187,6 +1239,14 @@ def _resolve_planning_v2_config(config: dict[str, Any]) -> dict[str, Any]:
         "tx_unbalance_weight": 2.0,
         "segment_unbalance_weight": 2.0,
         "phase_balance_hard_constraint": False,
+        "service_grouping_enabled": True,
+        "service_group_neighbor_radius_m": 12.0,
+        "service_group_min_users": 2,
+        "service_group_max_users": 8,
+        "service_group_max_diameter_m": 20.0,
+        "service_group_max_service_drop_m": 25.0,
+        "service_group_attach_search_radius_m": 35.0,
+        "service_group_extra_attach_penalty": 200000.0,
         "max_service_drop_m": 25.0,
         "max_pole_span_m": 50.0,
         "pole_user_clearance_m": 5.0,

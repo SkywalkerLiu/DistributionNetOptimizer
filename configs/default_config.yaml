@@ -125,6 +125,14 @@ planning_v2:
   phase_unbalance_weight: 3.0
   tx_unbalance_weight: 2.0
   segment_unbalance_weight: 2.0
+  service_grouping_enabled: true
+  service_group_neighbor_radius_m: 12.0
+  service_group_min_users: 2
+  service_group_max_users: 8
+  service_group_max_diameter_m: 20.0
+  service_group_max_service_drop_m: 25.0
+  service_group_attach_search_radius_m: 35.0
+  service_group_extra_attach_penalty: 200000.0
   max_service_drop_m: 25.0
   max_pole_span_m: 50.0
   pole_user_clearance_m: 5.0

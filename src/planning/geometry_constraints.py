@@ -96,15 +96,19 @@ def line_min_user_clearance(
     line: LineString,
     user_points: Mapping[int, Point],
     exclude_user_id: int | None = None,
+    exclude_user_ids: set[int] | None = None,
 ) -> float:
     """Return the minimum horizontal distance from a line to user points."""
 
     if not user_points:
         return float("inf")
+    excluded = set(exclude_user_ids or set())
+    if exclude_user_id is not None:
+        excluded.add(int(exclude_user_id))
     distances = [
         float(line.distance(user_point))
         for user_id, user_point in user_points.items()
-        if exclude_user_id is None or int(user_id) != int(exclude_user_id)
+        if int(user_id) not in excluded
     ]
     return min(distances, default=float("inf"))
 

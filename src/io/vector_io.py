@@ -26,6 +26,9 @@ FEATURE_LAYER_DEFINITIONS: dict[str, tuple[str, dict[str, str]]] = {
             "elev_m": "float64",
             "connected_node_id": "object",
             "voltage_drop_pct": "float64",
+            "service_group_id": "object",
+            "service_group_size": "int64",
+            "is_service_singleton": "int64",
         },
     ),
     "forest": (
@@ -82,6 +85,8 @@ FEATURE_LAYER_DEFINITIONS: dict[str, tuple[str, dict[str, str]]] = {
             "elev_m": "float64",
             "ground_slope_deg": "float64",
             "source": "object",
+            "service_group_id": "object",
+            "served_user_count": "int64",
             "user_clearance_m": "float64",
             "required_user_clearance_m": "float64",
             "is_violation": "int64",

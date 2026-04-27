@@ -137,6 +137,72 @@ def test_optimizer_outputs_v2_radial_plan() -> None:
     assert nx.is_forest(graph)
 
 
+def test_optimizer_groups_dense_users_on_shared_service_pole() -> None:
+    config = _config()
+    config["planning_v2"].update(
+        {
+            "tx_prefilter_top_k": 2,
+            "candidate_solution_pool_size": 2,
+            "local_search_top_k": 0,
+            "parallel_candidate_eval": False,
+            "root_feeder_min_count": 1,
+            "root_feeder_count_penalty_weight": 0.0,
+            "line_user_clearance_m": 0.0,
+            "service_group_neighbor_radius_m": 12.0,
+            "service_group_max_diameter_m": 20.0,
+            "service_group_max_service_drop_m": 25.0,
+        }
+    )
+    profile = build_raster_profile(width=30, height=30, resolution=4.0, crs="EPSG:3857", origin_y=120.0)
+    dtm = np.zeros((30, 30), dtype=np.float32)
+    slope = np.zeros_like(dtm, dtype=np.float32)
+    roughness = np.zeros_like(dtm, dtype=np.float32)
+    buildable = np.ones_like(dtm, dtype=np.uint8)
+    forbidden = np.zeros_like(dtm, dtype=np.uint8)
+    group_user_ids = {1, 2, 3, 4, 5}
+    users = _users(
+        [
+            (1, 42.0, 78.0, 7.0),
+            (2, 46.0, 78.0, 7.0),
+            (3, 44.0, 74.0, 7.0),
+            (4, 48.0, 74.0, 7.0),
+            (5, 50.0, 78.0, 7.0),
+            (6, 86.0, 34.0, 12.0),
+        ]
+    )
+
+    optimized = optimize_distribution_network(
+        config=config,
+        dtm=dtm,
+        slope=slope,
+        roughness=roughness,
+        buildable_mask=buildable,
+        forbidden_mask=forbidden,
+        profile=profile,
+        users=users,
+    )
+
+    connected_nodes = set(
+        optimized.users.loc[
+            optimized.users["user_id"].isin(group_user_ids),
+            "connected_node_id",
+        ]
+    )
+    assert len(connected_nodes) == 1
+    assert "service_group_id" in optimized.users.columns
+    assert optimized.users.loc[optimized.users["user_id"].isin(group_user_ids), "service_group_size"].max() >= 5
+
+    assert "service_grouping" in optimized.summary
+    assert optimized.summary["service_grouping"]["multi_user_group_count"] >= 1
+    assert optimized.summary["service_grouping"]["max_attach_nodes_per_group"] == 1
+
+    shared_poles = optimized.poles.loc[
+        optimized.poles["pole_type"] == "shared_service_pole"
+    ]
+    assert not shared_poles.empty
+    assert (shared_poles["served_user_count"] >= 2).any()
+
+
 def test_optimizer_reports_balancing_loss_and_voltage_metrics() -> None:
     config = _config()
     profile = build_raster_profile(width=26, height=26, resolution=4.0, crs="EPSG:3857", origin_y=104.0)
@@ -213,9 +279,9 @@ def test_optimizer_progress_bar_writes_terminal_status(capsys) -> None:
     )
 
     captured = capsys.readouterr()
-    assert "优化进度 [" in captured.out
-    assert "候选评估" in captured.out
-    assert "完成" in captured.out
+    assert "Optimization progress [" in captured.out
+    assert "Candidate evaluation" in captured.out
+    assert "Done" in captured.out
 
 
 def test_feasibility_reports_machine_readable_reason_codes() -> None:
@@ -593,6 +659,14 @@ def _config() -> dict:
             "tx_unbalance_weight": 1.0,
             "segment_unbalance_weight": 2.0,
             "phase_balance_hard_constraint": False,
+            "service_grouping_enabled": True,
+            "service_group_neighbor_radius_m": 12.0,
+            "service_group_min_users": 2,
+            "service_group_max_users": 8,
+            "service_group_max_diameter_m": 20.0,
+            "service_group_max_service_drop_m": 25.0,
+            "service_group_attach_search_radius_m": 35.0,
+            "service_group_extra_attach_penalty": 200000.0,
             "max_service_drop_m": 25.0,
             "max_pole_span_m": 50.0,
             "pole_user_clearance_m": 5.0,
