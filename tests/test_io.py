@@ -6,6 +6,8 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+import pytest
+import yaml
 from shapely.geometry import Point
 
 from src.io.raster_io import build_raster_profile, read_geotiff, read_raster_metadata, write_geotiff
@@ -81,6 +83,65 @@ def test_gpkg_layer_create_overwrite_append() -> None:
     assert len(users) == 2
     assert len(planned_lines) == 0
     assert set(list_layers(gpkg_path)) == {"planned_lines", "users"}
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_default_config_does_not_expose_unused_terrain_weight_aliases() -> None:
+    config_path = Path(__file__).resolve().parents[1] / "configs/default_config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    planning_cfg = config["planning"]
+    assert "terrain_slope_weight" not in planning_cfg
+    assert "terrain_roughness_weight" not in planning_cfg
+    assert "slope_weight" in planning_cfg
+    assert "roughness_weight" in planning_cfg
+
+
+def test_gpkg_overwrite_preserves_original_when_temp_write_fails(monkeypatch) -> None:
+    tmp_path = _workspace_tmpdir("gpkg_atomic_failure")
+    gpkg_path = tmp_path / "features.gpkg"
+    original_users = gpd.GeoDataFrame(
+        {
+            "user_id": [1],
+            "load_kw": [3.5],
+            "phase_type": ["A"],
+            "importance": [1],
+            "elev_m": [11.0],
+        },
+        geometry=[Point(1.0, 1.0)],
+        crs="EPSG:3857",
+    )
+    replacement_users = gpd.GeoDataFrame(
+        {
+            "user_id": [2],
+            "load_kw": [5.0],
+            "phase_type": ["B"],
+            "importance": [2],
+            "elev_m": [12.0],
+        },
+        geometry=[Point(2.0, 2.0)],
+        crs="EPSG:3857",
+    )
+    overwrite_layer(gpkg_path, "users", original_users)
+
+    from src.io import vector_io
+
+    real_write_dataframe = vector_io.pyogrio.write_dataframe
+
+    def fail_temp_write(*args, **kwargs):
+        if Path(args[1]).name.startswith(".features."):
+            raise RuntimeError("simulated temp write failure")
+        return real_write_dataframe(*args, **kwargs)
+
+    monkeypatch.setattr(vector_io.pyogrio, "write_dataframe", fail_temp_write)
+
+    with pytest.raises(RuntimeError, match="simulated temp write failure"):
+        overwrite_layer(gpkg_path, "users", replacement_users)
+
+    users = read_layer(gpkg_path, "users")
+    assert users["user_id"].tolist() == [1]
+    assert users["load_kw"].tolist() == [3.5]
+    assert not list(tmp_path.glob(".features.*.tmp.gpkg*"))
     shutil.rmtree(tmp_path, ignore_errors=True)
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import uuid
 from collections import OrderedDict
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -271,10 +273,26 @@ def _write_layer_specs(
     """Rewrite a GeoPackage from a complete ordered set of layers."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    _cleanup_gpkg_sidecars(path)
-    if path.exists():
-        path.unlink()
+    temp_path = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp{path.suffix}")
+    try:
+        _write_layer_specs_to_path(temp_path, layer_specs)
+        _cleanup_gpkg_sidecars(path)
+        temp_path.replace(path)
+        with suppress(OSError):
+            _cleanup_gpkg_sidecars(temp_path)
+    except Exception:
+        _delete_gpkg_bundle(temp_path)
+        raise
+    return path
 
+
+def _write_layer_specs_to_path(
+    path: Path,
+    layer_specs: OrderedDict[str, tuple[gpd.GeoDataFrame, str]],
+) -> None:
+    """Write all GeoPackage layers to a new target path."""
+
+    _delete_gpkg_bundle(path)
     mode = "w"
     for layer_name, (gdf, geometry_type) in layer_specs.items():
         normalized = gdf.copy()
@@ -290,7 +308,6 @@ def _write_layer_specs(
             geometry_type=geometry_type,
         )
         mode = "a"
-    return path
 
 
 def _normalize_crs(
@@ -361,3 +378,11 @@ def _cleanup_gpkg_sidecars(path: Path) -> None:
             candidate = path.with_suffix(path.suffix + suffix)
         if candidate.exists():
             candidate.unlink()
+
+
+def _delete_gpkg_bundle(path: Path) -> None:
+    """Remove a GeoPackage file plus SQLite sidecars."""
+
+    _cleanup_gpkg_sidecars(path)
+    if path.exists():
+        path.unlink()

@@ -94,8 +94,6 @@ planning:
   clearance_search_radius_m: 12.0
   clearance_max_repair_depth: 6
   terrain_length_weight: 1.0
-  terrain_slope_weight: 2.0
-  terrain_roughness_weight: 1.0
   forbidden_edge_sample_step_m: 5.0
   forbidden_cost: 1000000.0
   slope_weight: 2.5
