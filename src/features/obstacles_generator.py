@@ -20,6 +20,11 @@ def generate_obstacle_layers(
     """Generate forest, water, and manual no-build polygons."""
 
     obstacles_cfg = config["obstacles"]
+    if obstacles_cfg.get("source") == "ovi_screenshot":
+        from src.features.ovi_screenshot_features import generate_ovi_obstacles
+
+        return generate_ovi_obstacles(config, crs=crs)
+
     seed = int(config["scene"]["seed"]) + 303
     rng = np.random.default_rng(seed)
 

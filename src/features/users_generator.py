@@ -22,6 +22,11 @@ def generate_users(
     """Generate user points while respecting spacing and validity constraints."""
 
     users_cfg = config["users"]
+    if users_cfg.get("source") == "ovi_screenshot":
+        from src.features.ovi_screenshot_features import generate_ovi_users
+
+        return generate_ovi_users(config, dtm=dtm, transform=transform, crs=crs)
+
     scene_cfg = config["scene"]
     count = _resolve_user_count(users_cfg)
     distribution_mode = str(users_cfg.get("distribution_mode", "uniform"))

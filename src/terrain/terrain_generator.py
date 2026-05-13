@@ -11,6 +11,11 @@ def generate_terrain(config: dict[str, Any]) -> np.ndarray:
 
     scene_cfg = config["scene"]
     terrain_cfg = config["terrain"]
+    if terrain_cfg.get("base_type") == "ovi_screenshot":
+        from src.terrain.ovi_screenshot_terrain import generate_ovi_screenshot_terrain
+
+        return generate_ovi_screenshot_terrain(config)
+
     width = int(round(scene_cfg["width_m"] / scene_cfg["resolution_m"]))
     height = int(round(scene_cfg["height_m"] / scene_cfg["resolution_m"]))
 
